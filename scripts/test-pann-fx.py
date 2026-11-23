@@ -86,7 +86,10 @@ def main(dll_path: str):
     rack = rack_ptr.contents
     assert rack.code == b"PANN"
     assert rack.fuid == b"A1B2C3D4E5F647898A9B0C1D2E3F4A5B"
-    assert rack.version == b"0.1.2"
+    dll_name = Path(dll_path).name
+    if dll_name.startswith("pann-v") and dll_name.endswith(".fx.audcore"):
+        expected_ver = dll_name[len("pann-v") : -len(".fx.audcore")].encode("utf-8")
+        assert rack.version == expected_ver, f"Expected version {expected_ver}, got {rack.version}"
     assert rack.size == c.sizeof(Rack)
 
     library.audcore_fx_get_definition.argtypes = [u32, c.POINTER(u32)]

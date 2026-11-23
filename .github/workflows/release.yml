@@ -1,0 +1,80 @@
+name: Release Pann Audcore FX
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: windows-x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync CMake version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+          $cmake = Get-Content -Raw -LiteralPath CMakeLists.txt
+          $updated = $cmake -replace 'project\(PannFx VERSION [0-9]+\.[0-9]+\.[0-9]+ LANGUAGES CXX\)', "project(PannFx VERSION $ver LANGUAGES CXX)"
+          Set-Content -NoNewline -Encoding UTF8 -LiteralPath CMakeLists.txt -Value $updated
+
+      - name: Configure, build, and verify Audcore FX
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE) { throw 'CMake configure failed' }
+          cmake --build build --config Release --parallel 2 --target PANNLocalFx PannTests
+          if ($LASTEXITCODE) { throw 'CMake build failed' }
+          & build/Release/PannTests.exe
+          if ($LASTEXITCODE) { throw 'PannTests failed' }
+          $artifact = Get-ChildItem -LiteralPath build/package -Filter "pann-v*.fx.audcore" | Select-Object -First 1
+          if (-not $artifact) { throw 'Packaged .fx.audcore artifact not found' }
+          $env:PYTHONUTF8 = '1'
+          python scripts/test-pann-fx.py $artifact.FullName
+          if ($LASTEXITCODE) { throw 'test-pann-fx.py verification failed' }
+
+      - name: Upload Windows Audcore FX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-audcore-fx
+          path: build/package/pann-v*.fx.audcore
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows Audcore FX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-audcore-fx
+          path: packages
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/pann-v*.fx.audcore
+          generate_release_notes: true
+          fail_on_unmatched_files: true
