@@ -345,6 +345,8 @@ struct SharedScopeState {
     ScopeRingBuffer ringBuffer;
     std::atomic<uint32_t> sampleRate{48000};
     std::atomic<int> scopeEnabled{1};
+    std::atomic<int> scopeCollapsed{0};
+    std::atomic<int> extendedRange{0};
 };
 
 std::shared_ptr<SharedScopeState> scopeStateFor(uint32_t id);

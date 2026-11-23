@@ -18,8 +18,10 @@ namespace {
 constexpr char kCode[] = "PANN";
 constexpr char kFuid[] = "A1B2C3D4E5F647898A9B0C1D2E3F4A5B";
 constexpr float kDefaultNormalized = 0.5f; // 0 deg
-constexpr uint8_t kStateVersion = 1u;
-constexpr uint32_t kStateBytes = 5u;
+constexpr uint8_t kStateVersionLegacy = 1u;
+constexpr uint8_t kStateVersion = 2u;
+constexpr uint32_t kStateBytesLegacy = 5u;
+constexpr uint32_t kStateBytes = 6u;
 constexpr uint32_t kMaxVisualFloatsPerPoll = 1024u; // 512 stereo points
 constexpr uint32_t kTargetScatterPointsPerSec = 16000u; // ~267 scatter points per 60 FPS frame
 
@@ -161,9 +163,15 @@ uint32_t save(void* handle, uint8_t* output, uint32_t capacity) {
     if (capacity < kStateBytes) {
         return 0;
     }
-    const float norm = static_cast<Rack*>(handle)->normalizedAngle.load(std::memory_order_relaxed);
+    auto* rack = static_cast<Rack*>(handle);
+    const float norm = rack->normalizedAngle.load(std::memory_order_relaxed);
+    const uint8_t collapsedFlag =
+        (rack->scopeState->scopeCollapsed.load(std::memory_order_relaxed) != 0) ? 0x01u : 0x00u;
+    const uint8_t extendedFlag =
+        (rack->scopeState->extendedRange.load(std::memory_order_relaxed) != 0) ? 0x02u : 0x00u;
     output[0] = kStateVersion;
     std::memcpy(output + 1, &norm, sizeof(float));
+    output[5] = static_cast<uint8_t>(collapsedFlag | extendedFlag);
     return kStateBytes;
 }
 
@@ -176,9 +184,18 @@ int restore(void* handle, const uint8_t* input, uint32_t size) {
         rack->normalizedAngle.store(kDefaultNormalized, std::memory_order_relaxed);
         rack->smoother.setCurrentAndTarget(static_cast<double>(kDefaultNormalized));
         rack->snapPending.store(1, std::memory_order_release);
+        rack->scopeState->scopeCollapsed.store(0, std::memory_order_relaxed);
+        rack->scopeState->scopeEnabled.store(1, std::memory_order_relaxed);
+        rack->scopeState->extendedRange.store(0, std::memory_order_relaxed);
         return 1;
     }
-    if (!input || size != kStateBytes || input[0] != kStateVersion) {
+    if (!input) {
+        return 0;
+    }
+    const uint8_t ver = input[0];
+    if ((ver == kStateVersionLegacy && size != kStateBytesLegacy)
+        || (ver == kStateVersion && (size != kStateBytes || (input[5] & ~0x03u) != 0))
+        || (ver != kStateVersionLegacy && ver != kStateVersion)) {
         return 0;
     }
     float norm = 0.0f;
@@ -186,9 +203,19 @@ int restore(void* handle, const uint8_t* input, uint32_t size) {
     if (!std::isfinite(norm) || !(norm >= 0.0f && norm <= 1.0f)) {
         return 0;
     }
+    const bool collapsed = (ver == kStateVersion) && ((input[5] & 0x01u) != 0);
+    const bool extended = (ver == kStateVersion)
+        ? ((input[5] & 0x02u) != 0)
+        : (std::abs(normalizedToIntDegrees(static_cast<double>(norm))) > 45);
     rack->normalizedAngle.store(norm, std::memory_order_relaxed);
     rack->smoother.setCurrentAndTarget(static_cast<double>(norm));
     rack->snapPending.store(1, std::memory_order_release);
+    rack->scopeState->scopeCollapsed.store(collapsed ? 1 : 0, std::memory_order_relaxed);
+    rack->scopeState->scopeEnabled.store(collapsed ? 0 : 1, std::memory_order_relaxed);
+    rack->scopeState->extendedRange.store(extended ? 1 : 0, std::memory_order_relaxed);
+    if (collapsed) {
+        rack->scopeState->ringBuffer.reset();
+    }
     return 1;
 }
 

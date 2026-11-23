@@ -187,18 +187,26 @@ def main(dll_path: str):
         rack.visual_active(inst0, 0)
         assert rack.visual(inst0, vis_out, 64) == 0
 
-        # State save & restore + corrupt input rejection
+        # State save & restore (v2 6-byte state with collapsed & extendedRange flags + legacy v1 5-byte state)
         req_bytes = rack.save(inst0, None, 0)
-        assert req_bytes == 5
+        assert req_bytes == 6
         state_buf = (c.c_uint8 * req_bytes)()
-        assert rack.save(inst0, state_buf, req_bytes) == 5
+        assert rack.save(inst0, state_buf, req_bytes) == 6
+        assert state_buf[0] == 2 and state_buf[5] == 0
         assert rack.restore(inst1, state_buf, req_bytes) == 1
         assert abs(rack.get(inst1, 0) - 0.75) < 1e-6
 
-        bad_ver = (c.c_uint8 * 5)(2, 0, 0, 0, 0)
-        assert not rack.restore(inst1, bad_ver, 5)
-        bad_float = (c.c_uint8 * 5).from_buffer_copy(b"\x01" + struct.pack("<f", 1.5))
-        assert not rack.restore(inst1, bad_float, 5)
+        # Legacy v1 5-byte state still restores cleanly
+        legacy_v1 = (c.c_uint8 * 5).from_buffer_copy(b"\x01" + struct.pack("<f", 0.625))
+        assert rack.restore(inst1, legacy_v1, 5) == 1
+        assert abs(rack.get(inst1, 0) - 0.625) < 1e-6
+
+        bad_ver = (c.c_uint8 * 6)(3, 0, 0, 0, 0, 0)
+        assert not rack.restore(inst1, bad_ver, 6)
+        bad_flags = (c.c_uint8 * 6).from_buffer_copy(b"\x02" + struct.pack("<f", 0.5) + b"\x04")
+        assert not rack.restore(inst1, bad_flags, 6)
+        bad_float = (c.c_uint8 * 6).from_buffer_copy(b"\x02" + struct.pack("<f", 1.5) + b"\x00")
+        assert not rack.restore(inst1, bad_float, 6)
         assert rack.restore(inst1, None, 0) == 1
         assert abs(rack.get(inst1, 0) - 0.5) < 1e-6
     finally:
@@ -337,6 +345,18 @@ def main(dll_path: str):
             for val in ext_drag_vals:
                 deg = -180.0 + val * 360.0
                 assert abs(deg - round(deg)) < 1e-9, f"Slider value {deg} not quantized to 1 deg"
+
+            # Verify state persistence of collapsed & extendedRange flags when saved from live_inst
+            # Collapse scope again so both collapsed (bit 0) and extendedRange (bit 1) are True (flags == 0x03)
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (collapse)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
+            live_state = (c.c_uint8 * 6)()
+            assert rack.save(live_inst, live_state, 6) == 6
+            assert live_state[5] == 0x03, f"Expected saved state flags 0x03 (collapsed + extended), got {live_state[5]:#x}"
+
+            # Expand back before finishing UI tests
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (expand)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
 
             # Double-click on slider resets to 0.5 (0 deg) and updates textbox to "0"
             edits.clear()

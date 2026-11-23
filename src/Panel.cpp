@@ -52,9 +52,9 @@ struct Words {
     const wchar_t* extendRangeLabel;
 };
 
-constexpr Words kChinese{L"声场相位", L"旋转角度", L"收起", L"展开", L"扩展 ±180°"};
-constexpr Words kEnglish{L"声场相位", L"ROTATION", L"Hide", L"Show", L"Ext ±180°"};
-constexpr Words kJapanese{L"声场相位", L"回転角度", L"隠す", L"表示", L"拡張 ±180°"};
+constexpr Words kChinese{L"声场相位可视化", L"旋转角度", L"收起", L"展开", L"扩展 ±180°"};
+constexpr Words kEnglish{L"声场相位可视化", L"ROTATION", L"Hide", L"Show", L"Ext ±180°"};
+constexpr Words kJapanese{L"声场相位可视化", L"回転角度", L"隠す", L"表示", L"拡張 ±180°"};
 
 struct Box {
     float x = 0.0f;
@@ -210,6 +210,7 @@ class Panel {
     float scale_ = 1.0f;
 
     double normalizedAngle_ = 0.5; // 0 deg
+    int lastEditDeg_ = -9999;
     bool draggingSlider_ = false;
     bool hoveringSlider_ = false;
     bool hoveringToggle_ = false;
@@ -313,11 +314,13 @@ public:
         }
 
         editBrush_ = CreateSolidBrush(RGB(10, 13, 18)); // #0A0D12 (kBgField)
+        // Created hidden so normal slider dragging renders directly in the GDI+ backbuffer
+        // with zero Win32 child-control repaint lag; shown only when the user clicks to type.
         edit_ = CreateWindowExW(
             0,
             L"EDIT",
             L"0",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_RIGHT | ES_AUTOHSCROLL,
+            WS_CHILD | WS_TABSTOP | ES_RIGHT | ES_AUTOHSCROLL,
             0,
             0,
             0,
@@ -334,11 +337,25 @@ public:
 
         liveScope_ = latestScopeState();
         if (liveScope_) {
-            liveScope_->scopeEnabled.store(1, std::memory_order_relaxed);
+            scopeCollapsed_ = liveScope_->scopeCollapsed.load(std::memory_order_relaxed) != 0;
+            extendedRange_ = liveScope_->extendedRange.load(std::memory_order_relaxed) != 0;
+            liveScope_->scopeEnabled.store(scopeCollapsed_ ? 0 : 1, std::memory_order_relaxed);
         }
+        if (std::abs(normalizedToIntDegrees(normalizedAngle_)) > 45) {
+            extendedRange_ = true;
+            if (liveScope_) {
+                liveScope_->extendedRange.store(1, std::memory_order_relaxed);
+            }
+        }
+
         syncEditBoxText();
         resize(initW, initH, initialScale);
-        SetTimer(window_, kScopeTimerId, kScopeTimerMs, nullptr);
+        if (scopeCollapsed_) {
+            resizeHostWindowHeight(kCollapsedLogicalHeight);
+            updateLayout();
+        } else {
+            SetTimer(window_, kScopeTimerId, kScopeTimerMs, nullptr);
+        }
         return true;
     }
 
@@ -388,10 +405,25 @@ public:
         if (index != 0 || !std::isfinite(value) || draggingSlider_) {
             return;
         }
+        if (!liveScope_) {
+            liveScope_ = latestScopeState();
+        }
+        if (liveScope_) {
+            const bool savedCollapsed = liveScope_->scopeCollapsed.load(std::memory_order_relaxed) != 0;
+            const bool savedExtended = liveScope_->extendedRange.load(std::memory_order_relaxed) != 0;
+            extendedRange_ = savedExtended;
+            if (savedCollapsed != scopeCollapsed_) {
+                scopeCollapsed_ = !savedCollapsed; // toggleScopeCollapsed flips it to savedCollapsed
+                toggleScopeCollapsed(false);
+            }
+        }
         normalizedAngle_ = quantizeNormalizedToIntDegrees(std::clamp(value, 0.0, 1.0));
         const int deg = normalizedToIntDegrees(normalizedAngle_);
-        if (std::abs(deg) > 45) {
+        if (std::abs(deg) > 45 && !extendedRange_) {
             extendedRange_ = true;
+            if (liveScope_) {
+                liveScope_->extendedRange.store(1, std::memory_order_relaxed);
+            }
         }
         if (!edit_ || GetFocus() != edit_) {
             syncEditBoxText();
@@ -434,6 +466,39 @@ private:
         if (window_) {
             InvalidateRect(window_, nullptr, FALSE);
         }
+    }
+
+    void notifyStateChanged() noexcept {
+        if (editCallback_) {
+            editCallback_(editContext_, 11, 0, 0.0);
+            emitEdit(2, normalizedAngle_);
+            emitEdit(0, normalizedAngle_);
+            emitEdit(3, normalizedAngle_);
+        }
+    }
+
+    void beginTextEdit() noexcept {
+        if (!edit_) {
+            return;
+        }
+        syncEditBoxText(true);
+        ShowWindow(edit_, SW_SHOW);
+        SetFocus(edit_);
+        SendMessageW(edit_, EM_SETSEL, 0, -1);
+        invalidate();
+    }
+
+    void endTextEdit(bool commit) noexcept {
+        if (!edit_) {
+            return;
+        }
+        if (commit) {
+            commitEditBox();
+        } else {
+            syncEditBoxText(true);
+        }
+        ShowWindow(edit_, SW_HIDE);
+        invalidate();
     }
 
     void resizeHostWindowHeight(float targetLogicalH) noexcept {
@@ -502,13 +567,16 @@ private:
         inProgrammaticResize_ = false;
     }
 
-    void toggleScopeCollapsed() noexcept {
+    void toggleScopeCollapsed(bool notifyHost = true) noexcept {
         if (!scopeCollapsed_ && height_ >= 240.0f) {
             expandedLogicalHeight_ = height_;
         }
         scopeCollapsed_ = !scopeCollapsed_;
         if (!liveScope_) {
             liveScope_ = latestScopeState();
+        }
+        if (liveScope_) {
+            liveScope_->scopeCollapsed.store(scopeCollapsed_ ? 1 : 0, std::memory_order_relaxed);
         }
         if (scopeCollapsed_) {
             // Stop all UI timer ticks, clear scatter history, and stop audio-thread scope sampling
@@ -533,11 +601,20 @@ private:
             }
         }
         updateLayout();
+        if (notifyHost) {
+            notifyStateChanged();
+        }
         invalidate();
     }
 
     void toggleExtendedRange() noexcept {
         extendedRange_ = !extendedRange_;
+        if (!liveScope_) {
+            liveScope_ = latestScopeState();
+        }
+        if (liveScope_) {
+            liveScope_->extendedRange.store(extendedRange_ ? 1 : 0, std::memory_order_relaxed);
+        }
         if (!extendedRange_) {
             // Clamp active angle into [-45, +45] when switching back to default range
             const int curDeg = normalizedToIntDegrees(normalizedAngle_);
@@ -549,6 +626,7 @@ private:
                 return;
             }
         }
+        notifyStateChanged();
         invalidate();
     }
 
@@ -575,11 +653,15 @@ private:
         }
     }
 
-    void syncEditBoxText() noexcept {
+    void syncEditBoxText(bool force = false) noexcept {
         if (!edit_) {
             return;
         }
         const int deg = normalizedToIntDegrees(normalizedAngle_);
+        if (!force && deg == lastEditDeg_) {
+            return;
+        }
+        lastEditDeg_ = deg;
         wchar_t buf[16]{};
         std::swprintf(buf, std::size(buf), L"%d", deg);
         updatingEditText_ = true;
@@ -595,15 +677,21 @@ private:
         GetWindowTextW(edit_, buf, static_cast<int>(std::size(buf)));
         int parsedDeg = 0;
         if (tryParseIntDegrees(buf, parsedDeg)) {
-            if (std::abs(parsedDeg) > 45) {
+            if (std::abs(parsedDeg) > 45 && !extendedRange_) {
                 extendedRange_ = true;
+                if (!liveScope_) {
+                    liveScope_ = latestScopeState();
+                }
+                if (liveScope_) {
+                    liveScope_->extendedRange.store(1, std::memory_order_relaxed);
+                }
             }
             const double nextNorm = intDegreesToNormalized(parsedDeg);
             emitEdit(2, nextNorm);
             setAngleInteractive(nextNorm);
             emitEdit(3, nextNorm);
         } else {
-            syncEditBoxText();
+            syncEditBoxText(true);
         }
     }
 
@@ -644,7 +732,7 @@ private:
             };
         }
 
-        // Collapse toggle button to the right of "声场相位" title inside scopeCardBox_ header
+        // Collapse toggle button to the right of "声场相位可视化" title inside scopeCardBox_ header
         const float toggleW = 54.0f;
         const float toggleH = 22.0f;
         toggleBtnBox_ = Box{
@@ -728,6 +816,9 @@ private:
         syncEditBoxText();
         emitEdit(0, quantized);
         invalidate();
+        if (window_) {
+            UpdateWindow(window_);
+        }
     }
 
     void resetToCenter() noexcept {
@@ -797,7 +888,7 @@ private:
 
         const Box headerBounds{inner.x, inner.y, inner.w, 22.0f};
 
-        // Header dot (amber when active, dim when collapsed) + "声场相位" title + collapse toggle button
+        // Header dot (amber when active, dim when collapsed) + "声场相位可视化" title + collapse toggle button
         const float dotSize = 7.0f;
         SolidBrush dotBrush(scopeCollapsed_ ? kTextDim : kAmberTrace);
         g.FillEllipse(
@@ -817,7 +908,7 @@ private:
             false,
             StringAlignmentNear);
 
-        // Collapse / Expand toggle button on the right of "声场相位"
+        // Collapse / Expand toggle button on the right of "声场相位可视化"
         fillRoundRect(
             g,
             toggleBtnBox_,
@@ -1018,7 +1109,8 @@ private:
     }
 
     void paintSliderCard(Graphics& g) {
-        const bool editFocused = edit_ && (GetFocus() == edit_);
+        const bool editVisible = edit_ && IsWindowVisible(edit_);
+        const bool editFocused = editVisible && (GetFocus() == edit_);
         fillRoundRect(g, sliderCardBox_, kBgCard, 6.0f);
         drawRoundRect(
             g,
@@ -1068,6 +1160,24 @@ private:
             editFocused ? kAmberTrace : kBorderHairline,
             4.0f,
             editFocused ? 1.3f : 1.0f);
+
+        // When not actively typing in the native EDIT control, draw the integer degree
+        // directly in the GDI+ backbuffer so it updates on the exact same frame as the slider thumb!
+        if (!editVisible) {
+            const int deg = normalizedToIntDegrees(normalizedAngle_);
+            wchar_t degBuf[16]{};
+            std::swprintf(degBuf, std::size(degBuf), L"%d", deg);
+            drawLabel(
+                g,
+                degBuf,
+                Box{editInnerBox_.x, editFrameBox_.y, editInnerBox_.w, editFrameBox_.h},
+                13.0f,
+                deg == 0 ? kTextPrimary : kAmberTrace,
+                true,
+                true,
+                StringAlignmentFar);
+        }
+
         drawLabel(
             g,
             L"\x00B0",
@@ -1183,14 +1293,14 @@ private:
 
             case WM_KEYDOWN: {
                 if (wParam == VK_RETURN) {
-                    self->commitEditBox();
+                    self->endTextEdit(true);
                     if (self->window_) {
                         SetFocus(self->window_);
                     }
                     return 0;
                 }
                 if (wParam == VK_ESCAPE) {
-                    self->syncEditBoxText();
+                    self->endTextEdit(false);
                     if (self->window_) {
                         SetFocus(self->window_);
                     }
@@ -1223,8 +1333,7 @@ private:
             }
 
             case WM_KILLFOCUS: {
-                self->commitEditBox();
-                self->invalidate();
+                self->endTextEdit(true);
                 break;
             }
         }
@@ -1274,6 +1383,13 @@ private:
             case WM_LBUTTONDOWN: {
                 const float lx = static_cast<float>(GET_X_LPARAM(lParam)) / self->scale_;
                 const float ly = static_cast<float>(GET_Y_LPARAM(lParam)) / self->scale_;
+                if (self->editFrameBox_.contains(lx, ly) && self->edit_) {
+                    self->beginTextEdit();
+                    return 0;
+                }
+                if (self->edit_ && IsWindowVisible(self->edit_)) {
+                    self->endTextEdit(true);
+                }
                 if (self->toggleBtnBox_.contains(lx, ly)) {
                     SetFocus(hwnd);
                     self->toggleScopeCollapsed();
@@ -1282,11 +1398,6 @@ private:
                 if (self->rangeBtnBox_.contains(lx, ly)) {
                     SetFocus(hwnd);
                     self->toggleExtendedRange();
-                    return 0;
-                }
-                if (self->editFrameBox_.contains(lx, ly) && self->edit_) {
-                    SetFocus(self->edit_);
-                    SendMessageW(self->edit_, EM_SETSEL, 0, -1);
                     return 0;
                 }
                 SetFocus(hwnd);
