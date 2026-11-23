@@ -27,6 +27,18 @@ inline double degreesToNormalized(double deg) noexcept {
     return std::clamp((deg + 180.0) / 360.0, 0.0, 1.0);
 }
 
+inline int normalizedToIntDegrees(double norm) noexcept {
+    return std::clamp(static_cast<int>(std::lround(normalizedToDegrees(norm))), -180, 180);
+}
+
+inline double intDegreesToNormalized(int deg) noexcept {
+    return degreesToNormalized(static_cast<double>(std::clamp(deg, -180, 180)));
+}
+
+inline double quantizeNormalizedToIntDegrees(double norm) noexcept {
+    return intDegreesToNormalized(normalizedToIntDegrees(norm));
+}
+
 inline double normalizedToRadians(double norm) noexcept {
     return (2.0 * std::clamp(norm, 0.0, 1.0) - 1.0) * kPi;
 }

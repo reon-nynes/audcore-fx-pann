@@ -4,13 +4,16 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <objidl.h>
 #include <gdiplus.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <memory>
 #include <new>
 #include <string_view>
@@ -128,9 +131,38 @@ void drawLabel(Graphics& g,
     g.DrawString(text, -1, &font, rect, &format, &brush);
 }
 
+bool tryParseIntDegrees(const wchar_t* text, int& outDeg) noexcept {
+    if (!text) {
+        return false;
+    }
+    const wchar_t* p = text;
+    while (*p && std::iswspace(*p)) {
+        ++p;
+    }
+    if (*p == L'\0') {
+        return false;
+    }
+    wchar_t* endPtr = nullptr;
+    const double parsed = std::wcstod(p, &endPtr);
+    if (endPtr == p || !std::isfinite(parsed)) {
+        return false;
+    }
+    while (*endPtr && (std::iswspace(*endPtr) || *endPtr == L'\x00B0' || *endPtr == L'd' || *endPtr == L'e' || *endPtr == L'g')) {
+        ++endPtr;
+    }
+    if (*endPtr != L'\0') {
+        return false;
+    }
+    outDeg = std::clamp(static_cast<int>(std::lround(parsed)), -180, 180);
+    return true;
+}
+
 class Panel {
     HWND parent_ = nullptr;
     HWND window_ = nullptr;
+    HWND edit_ = nullptr;
+    HFONT editFont_ = nullptr;
+    HBRUSH editBrush_ = nullptr;
     AudcoreFxEdit editCallback_ = nullptr;
     void* editContext_ = nullptr;
     ULONG_PTR gdiplusToken_ = 0;
@@ -141,13 +173,16 @@ class Panel {
     float height_ = static_cast<float>(kDefaultHeight);
     float scale_ = 1.0f;
 
-    double normalizedAngle_ = 0.5; // 0.0 deg
+    double normalizedAngle_ = 0.5; // 0 deg
     bool draggingSlider_ = false;
     bool hoveringSlider_ = false;
     bool trackingLeave_ = false;
+    bool updatingEditText_ = false;
 
     Box scopeCardBox_{};
     Box sliderCardBox_{};
+    Box editFrameBox_{};
+    Box editInnerBox_{};
     Box sliderTrackBox_{};
     Box sliderHitBox_{};
 
@@ -158,9 +193,21 @@ public:
         : parent_(parentWindow), editCallback_(callback), editContext_(context) {}
 
     ~Panel() {
+        if (edit_) {
+            RemoveWindowSubclass(edit_, editSubclassProc, 1);
+        }
         if (window_) {
             DestroyWindow(window_);
             window_ = nullptr;
+            edit_ = nullptr;
+        }
+        if (editFont_) {
+            DeleteObject(editFont_);
+            editFont_ = nullptr;
+        }
+        if (editBrush_) {
+            DeleteObject(editBrush_);
+            editBrush_ = nullptr;
         }
         backBuffer_.reset();
         if (gdiplusToken_) {
@@ -194,13 +241,16 @@ public:
             return false;
         }
 
+        const INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
+        InitCommonControlsEx(&controls);
+
         const int32_t initW = pixelWidth > 0 ? pixelWidth : kDefaultWidth;
         const int32_t initH = pixelHeight > 0 ? pixelHeight : kDefaultHeight;
         window_ = CreateWindowExW(
-            0,
+            WS_EX_CONTROLPARENT,
             kWindowClass,
             L"Pann",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN,
             0,
             0,
             initW,
@@ -213,6 +263,27 @@ public:
             return false;
         }
 
+        editBrush_ = CreateSolidBrush(RGB(10, 13, 18)); // #0A0D12 (kBgField)
+        edit_ = CreateWindowExW(
+            0,
+            L"EDIT",
+            L"0",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_RIGHT | ES_AUTOHSCROLL,
+            0,
+            0,
+            0,
+            0,
+            window_,
+            nullptr,
+            module,
+            nullptr);
+        if (!edit_) {
+            return false;
+        }
+        SendMessageW(edit_, EM_SETLIMITTEXT, 8, 0);
+        SetWindowSubclass(edit_, editSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+
+        syncEditBoxText();
         resize(initW, initH, initialScale);
         return true;
     }
@@ -226,6 +297,32 @@ public:
         if (window_) {
             SetWindowPos(window_, nullptr, 0, 0, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
         }
+
+        HFONT newFont = CreateFontW(
+            -std::max<int>(8, static_cast<int>(std::lround(13.0f * scale_))),
+            0,
+            0,
+            0,
+            FW_BOLD,
+            FALSE,
+            FALSE,
+            FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            FF_MODERN | FIXED_PITCH,
+            L"Consolas");
+        if (newFont) {
+            if (edit_) {
+                SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
+            }
+            if (editFont_) {
+                DeleteObject(editFont_);
+            }
+            editFont_ = newFont;
+        }
+
         updateLayout();
         invalidate();
     }
@@ -234,7 +331,10 @@ public:
         if (index != 0 || !std::isfinite(value) || draggingSlider_) {
             return;
         }
-        normalizedAngle_ = std::clamp(value, 0.0, 1.0);
+        normalizedAngle_ = quantizeNormalizedToIntDegrees(std::clamp(value, 0.0, 1.0));
+        if (!edit_ || GetFocus() != edit_) {
+            syncEditBoxText();
+        }
         invalidate();
     }
 
@@ -272,10 +372,48 @@ private:
         }
     }
 
+    void syncEditBoxText() noexcept {
+        if (!edit_) {
+            return;
+        }
+        const int deg = normalizedToIntDegrees(normalizedAngle_);
+        wchar_t buf[16]{};
+        std::swprintf(buf, std::size(buf), L"%d", deg);
+        updatingEditText_ = true;
+        SetWindowTextW(edit_, buf);
+        updatingEditText_ = false;
+    }
+
+    void commitEditBox() noexcept {
+        if (!edit_ || updatingEditText_) {
+            return;
+        }
+        wchar_t buf[32]{};
+        GetWindowTextW(edit_, buf, static_cast<int>(std::size(buf)));
+        int parsedDeg = 0;
+        if (tryParseIntDegrees(buf, parsedDeg)) {
+            const double nextNorm = intDegreesToNormalized(parsedDeg);
+            emitEdit(2, nextNorm);
+            setAngleInteractive(nextNorm);
+            emitEdit(3, nextNorm);
+        } else {
+            syncEditBoxText();
+        }
+    }
+
+    void stepByDegrees(int deltaDeg) noexcept {
+        const int curDeg = normalizedToIntDegrees(normalizedAngle_);
+        const int nextDeg = std::clamp(curDeg + deltaDeg, -180, 180);
+        const double nextNorm = intDegreesToNormalized(nextDeg);
+        emitEdit(2, nextNorm);
+        setAngleInteractive(nextNorm);
+        emitEdit(3, nextNorm);
+    }
+
     void updateLayout() noexcept {
         const float margin = 12.0f;
         const float footerHeight = 20.0f;
-        const float sliderCardH = 68.0f;
+        const float sliderCardH = 72.0f;
         const float gap = 10.0f;
 
         const float contentW = std::max(60.0f, width_ - 2.0f * margin);
@@ -295,10 +433,26 @@ private:
             sliderCardH
         };
 
+        // Top-right integer input box inside sliderCardBox_
+        const float frameW = 70.0f;
+        const float frameH = 24.0f;
+        const float frameX = sliderCardBox_.x + sliderCardBox_.w - 12.0f - frameW;
+        const float frameY = sliderCardBox_.y + 8.0f;
+        editFrameBox_ = Box{frameX, frameY, frameW, frameH};
+        editInnerBox_ = Box{frameX + 6.0f, frameY + 4.0f, frameW - 22.0f, frameH - 8.0f};
+
+        if (edit_) {
+            const int ex = static_cast<int>(std::lround(editInnerBox_.x * scale_));
+            const int ey = static_cast<int>(std::lround(editInnerBox_.y * scale_));
+            const int ew = std::max<int>(10, static_cast<int>(std::lround(editInnerBox_.w * scale_)));
+            const int eh = std::max<int>(10, static_cast<int>(std::lround(editInnerBox_.h * scale_)));
+            SetWindowPos(edit_, nullptr, ex, ey, ew, eh, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
         const float trackSidePad = 48.0f;
         const float trackX = sliderCardBox_.x + trackSidePad;
         const float trackW = std::max(24.0f, sliderCardBox_.w - 2.0f * trackSidePad);
-        const float trackY = sliderCardBox_.y + 42.0f;
+        const float trackY = sliderCardBox_.y + 46.0f;
         sliderTrackBox_ = Box{trackX, trackY, trackW, 6.0f};
         sliderHitBox_ = Box{
             sliderTrackBox_.x - kThumbRadius - 4.0f,
@@ -312,9 +466,9 @@ private:
         if (sliderTrackBox_.w <= 1.0f) {
             return 0.5;
         }
-        const double norm = static_cast<double>((lx - sliderTrackBox_.x) / sliderTrackBox_.w);
-        // Snap near 0 deg within 0.5px when not holding Ctrl
-        return std::clamp(norm, 0.0, 1.0);
+        const double rawNorm =
+            std::clamp(static_cast<double>((lx - sliderTrackBox_.x) / sliderTrackBox_.w), 0.0, 1.0);
+        return quantizeNormalizedToIntDegrees(rawNorm);
     }
 
     void emitEdit(int32_t kind, double norm) noexcept {
@@ -324,9 +478,10 @@ private:
     }
 
     void setAngleInteractive(double norm) noexcept {
-        const double clamped = std::clamp(norm, 0.0, 1.0);
-        normalizedAngle_ = clamped;
-        emitEdit(0, clamped);
+        const double quantized = quantizeNormalizedToIntDegrees(norm);
+        normalizedAngle_ = quantized;
+        syncEditBoxText();
+        emitEdit(0, quantized);
         invalidate();
     }
 
@@ -365,6 +520,12 @@ private:
         }
 
         Graphics output(dc);
+        if (edit_ && IsWindowVisible(edit_)) {
+            RECT input{};
+            GetWindowRect(edit_, &input);
+            MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&input), 2);
+            output.ExcludeClip(Rect(input.left, input.top, input.right - input.left, input.bottom - input.top));
+        }
         output.DrawImage(backBuffer_.get(), 0, 0, pixelW, pixelH);
     }
 
@@ -559,38 +720,43 @@ private:
     }
 
     void paintSliderCard(Graphics& g) {
+        const bool editFocused = edit_ && (GetFocus() == edit_);
         fillRoundRect(g, sliderCardBox_, kBgCard, 6.0f);
         drawRoundRect(
             g,
             sliderCardBox_,
-            (draggingSlider_ || hoveringSlider_) ? kBorderActive : kBorderHairline,
+            (draggingSlider_ || hoveringSlider_ || editFocused) ? kBorderActive : kBorderHairline,
             6.0f,
             1.0f);
 
-        const float headerY = sliderCardBox_.y + 8.0f;
+        const float headerY = sliderCardBox_.y + 10.0f;
         drawLabel(
             g,
             words_->rotationLabel,
-            Box{sliderCardBox_.x + 12.0f, headerY, 140.0f, 20.0f},
+            Box{sliderCardBox_.x + 12.0f, headerY, 160.0f, 20.0f},
             12.5f,
             kTextPrimary,
             true,
             false,
             StringAlignmentNear);
 
-        const double deg = normalizedToDegrees(normalizedAngle_);
-        wchar_t valueBuf[32]{};
-        std::swprintf(valueBuf, std::size(valueBuf), L"%+.1f\x00B0", deg);
-        const bool isNeutral = std::abs(deg) < 0.05;
+        // Integer input textbox frame + degree unit label
+        fillRoundRect(g, editFrameBox_, kBgField, 4.0f);
+        drawRoundRect(
+            g,
+            editFrameBox_,
+            editFocused ? kAmberTrace : kBorderHairline,
+            4.0f,
+            editFocused ? 1.3f : 1.0f);
         drawLabel(
             g,
-            valueBuf,
-            Box{sliderCardBox_.x + sliderCardBox_.w - 110.0f, headerY, 98.0f, 20.0f},
-            13.0f,
-            isNeutral ? kTextPrimary : kAmberTrace,
+            L"\x00B0",
+            Box{editFrameBox_.x + editFrameBox_.w - 15.0f, editFrameBox_.y, 12.0f, editFrameBox_.h},
+            12.0f,
+            kTextSecondary,
+            false,
             true,
-            true,
-            StringAlignmentFar);
+            StringAlignmentCenter);
 
         // Endpoint scale labels (-180 deg / +180 deg)
         drawLabel(
@@ -673,6 +839,67 @@ private:
             StringAlignmentFar);
     }
 
+    static LRESULT CALLBACK editSubclassProc(
+        HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR context) {
+        auto* self = reinterpret_cast<Panel*>(context);
+        if (!self) {
+            return DefSubclassProc(hwnd, message, wParam, lParam);
+        }
+
+        switch (message) {
+            case WM_GETDLGCODE:
+                return DefSubclassProc(hwnd, message, wParam, lParam) | DLGC_WANTALLKEYS;
+
+            case WM_KEYDOWN: {
+                if (wParam == VK_RETURN) {
+                    self->commitEditBox();
+                    if (self->window_) {
+                        SetFocus(self->window_);
+                    }
+                    return 0;
+                }
+                if (wParam == VK_ESCAPE) {
+                    self->syncEditBoxText();
+                    if (self->window_) {
+                        SetFocus(self->window_);
+                    }
+                    return 0;
+                }
+                if (wParam == VK_UP) {
+                    self->stepByDegrees(1);
+                    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                if (wParam == VK_DOWN) {
+                    self->stepByDegrees(-1);
+                    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                break;
+            }
+
+            case WM_CHAR:
+                if (wParam == L'\r' || wParam == L'\n' || wParam == 27) {
+                    return 0;
+                }
+                break;
+
+            case WM_SETFOCUS: {
+                const LRESULT res = DefSubclassProc(hwnd, message, wParam, lParam);
+                SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                self->invalidate();
+                return res;
+            }
+
+            case WM_KILLFOCUS: {
+                self->commitEditBox();
+                self->invalidate();
+                break;
+            }
+        }
+        return DefSubclassProc(hwnd, message, wParam, lParam);
+    }
+
     static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         auto* self = reinterpret_cast<Panel*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -688,6 +915,14 @@ private:
             case WM_ERASEBKGND:
                 return 1;
 
+            case WM_CTLCOLOREDIT: {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                const int deg = normalizedToIntDegrees(self->normalizedAngle_);
+                SetTextColor(hdc, deg == 0 ? RGB(230, 237, 243) : RGB(245, 158, 11));
+                SetBkColor(hdc, RGB(10, 13, 18));
+                return reinterpret_cast<LRESULT>(self->editBrush_);
+            }
+
             case WM_PAINT: {
                 PAINTSTRUCT ps{};
                 HDC dc = BeginPaint(hwnd, &ps);
@@ -699,10 +934,15 @@ private:
             }
 
             case WM_LBUTTONDOWN: {
-                SetFocus(hwnd);
                 const float lx = static_cast<float>(GET_X_LPARAM(lParam)) / self->scale_;
                 const float ly = static_cast<float>(GET_Y_LPARAM(lParam)) / self->scale_;
-                if (self->sliderHitBox_.contains(lx, ly) || self->sliderCardBox_.contains(lx, ly)) {
+                if (self->editFrameBox_.contains(lx, ly) && self->edit_) {
+                    SetFocus(self->edit_);
+                    SendMessageW(self->edit_, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                SetFocus(hwnd);
+                if (self->sliderHitBox_.contains(lx, ly)) {
                     if ((wParam & MK_CONTROL) != 0) {
                         self->resetToCenter();
                         return 0;
@@ -759,7 +999,8 @@ private:
             case WM_RBUTTONDOWN: {
                 const float lx = static_cast<float>(GET_X_LPARAM(lParam)) / self->scale_;
                 const float ly = static_cast<float>(GET_Y_LPARAM(lParam)) / self->scale_;
-                if (self->sliderHitBox_.contains(lx, ly) || self->sliderCardBox_.contains(lx, ly)) {
+                if (!self->editFrameBox_.contains(lx, ly)
+                    && (self->sliderHitBox_.contains(lx, ly) || self->sliderCardBox_.contains(lx, ly))) {
                     self->resetToCenter();
                 }
                 return 0;
@@ -768,15 +1009,9 @@ private:
             case WM_MOUSEWHEEL: {
                 const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
                 if (delta != 0) {
-                    const double stepDeg =
-                        ((wParam & MK_CONTROL) != 0) ? 0.1 : (((wParam & MK_SHIFT) != 0) ? 5.0 : 1.0);
-                    const double curDeg = normalizedToDegrees(self->normalizedAngle_);
-                    const double nextDeg =
-                        std::clamp(curDeg + (static_cast<double>(delta) / 120.0) * stepDeg, -180.0, 180.0);
-                    const double nextNorm = degreesToNormalized(nextDeg);
-                    self->emitEdit(2, nextNorm);
-                    self->setAngleInteractive(nextNorm);
-                    self->emitEdit(3, nextNorm);
+                    const int stepDeg = ((wParam & MK_SHIFT) != 0) ? 5 : 1;
+                    const int steps = (delta >= 0) ? std::max(1, delta / 120) : std::min(-1, delta / 120);
+                    self->stepByDegrees(steps * stepDeg);
                 }
                 return 0;
             }

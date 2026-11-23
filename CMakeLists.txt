@@ -29,7 +29,7 @@ target_compile_definitions(PANNLocalFx PRIVATE
 target_compile_options(PANNLocalFx PRIVATE /utf-8 /W4 /Gy /Gw /Zc:inline /experimental:deterministic
  "/pathmap:${CMAKE_CURRENT_SOURCE_DIR}=pann")
 target_link_options(PANNLocalFx PRIVATE /OPT:REF /OPT:ICF /INCREMENTAL:NO /DEBUG:NONE)
-target_link_libraries(PANNLocalFx PRIVATE user32 gdi32 gdiplus)
+target_link_libraries(PANNLocalFx PRIVATE user32 gdi32 gdiplus comctl32)
 set_target_properties(PANNLocalFx PROPERTIES
  PREFIX ""
  SUFFIX ".fx.audcore"

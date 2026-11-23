@@ -102,6 +102,7 @@ def main(dll_path: str):
     param0 = definition["parameters"][0]
     assert param0["id"] == "angle"
     assert param0["minimum"] == -180 and param0["maximum"] == 180
+    assert param0["step"] == 1
     assert param0["default"] == 0 and param0["component"] == "slider"
 
     # 2. Editor ABI presence & flags
@@ -252,8 +253,14 @@ def main(dll_path: str):
             user32.GetWindow.restype = w.HWND
             user32.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
             user32.SendMessageW.restype = w.LPARAM
+            user32.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
+            user32.SetWindowTextW.restype = w.BOOL
+            user32.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
+            user32.GetWindowTextW.restype = c.c_int
             child_hwnd = user32.GetWindow(parent_hwnd, 5)  # GW_CHILD
             assert child_hwnd, "Editor child HWND not found"
+            edit_hwnd = user32.GetWindow(child_hwnd, 5)  # GW_CHILD (the EDIT textbox)
+            assert edit_hwnd, "Integer input EDIT textbox HWND not found"
 
             # Slider at scale 1.25 (logical 420x480 -> sliderCard y ~ 388..456, x ~ 260 -> pixel x=325, y=535)
             lparam_drag_start = (535 << 16) | (325 & 0xFFFF)
@@ -262,13 +269,40 @@ def main(dll_path: str):
             user32.SendMessageW(child_hwnd, 0x0200, 1, lparam_drag_move)   # WM_MOUSEMOVE
             user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_drag_move)   # WM_LBUTTONUP
             assert any(k == 2 and idx == 0 for k, idx, _ in edits), f"Missing begin-edit in {edits}"
-            assert any(k == 0 and idx == 0 and val > 0.55 for k, idx, val in edits), f"Missing drag value in {edits}"
+            drag_vals = [val for k, idx, val in edits if k == 0 and idx == 0]
+            assert drag_vals and drag_vals[-1] > 0.55, f"Missing drag value in {edits}"
+            # Verify 1-deg quantization on slider drag
+            for val in drag_vals:
+                deg = -180.0 + val * 360.0
+                assert abs(deg - round(deg)) < 1e-9, f"Slider value {deg} not quantized to 1 deg"
             assert any(k == 3 and idx == 0 for k, idx, _ in edits), f"Missing end-edit in {edits}"
 
-            # Double-click resets to 0.5 (0 deg)
+            # Double-click on slider resets to 0.5 (0 deg) and updates textbox to "0"
             edits.clear()
             user32.SendMessageW(child_hwnd, 0x0203, 0, lparam_drag_start)  # WM_LBUTTONDBLCLK
             assert any(k == 0 and idx == 0 and abs(val - 0.5) < 1e-6 for k, idx, val in edits), f"Reset failed: {edits}"
+            text_buf = c.create_unicode_buffer(32)
+            user32.GetWindowTextW(edit_hwnd, text_buf, 32)
+            assert text_buf.value == "0", f"Expected textbox '0' after reset, got '{text_buf.value}'"
+
+            # Precise integer input via textbox + Enter key (VK_RETURN = 0x0D)
+            edits.clear()
+            user32.SetWindowTextW(edit_hwnd, "-37")
+            user32.SendMessageW(edit_hwnd, 0x0100, 0x0D, 0)  # WM_KEYDOWN VK_RETURN
+            expected_norm = (-37 + 180) / 360.0
+            assert any(k == 0 and idx == 0 and abs(val - expected_norm) < 1e-9 for k, idx, val in edits), (
+                f"Textbox input -37 failed: {edits}"
+            )
+
+            # Out-of-range integer input in textbox clamps to [-180, 180]
+            edits.clear()
+            user32.SetWindowTextW(edit_hwnd, "250")
+            user32.SendMessageW(edit_hwnd, 0x0100, 0x0D, 0)  # WM_KEYDOWN VK_RETURN
+            assert any(k == 0 and idx == 0 and abs(val - 1.0) < 1e-9 for k, idx, val in edits), (
+                f"Textbox clamp 250 -> 180 failed: {edits}"
+            )
+            user32.GetWindowTextW(edit_hwnd, text_buf, 32)
+            assert text_buf.value == "180", f"Expected clamped textbox '180', got '{text_buf.value}'"
 
             user32.UpdateWindow(child_hwnd)
             pump_messages()

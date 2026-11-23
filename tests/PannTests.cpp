@@ -16,13 +16,19 @@
 int main() {
     using namespace pann;
 
-    // 1. Angle conversions
+    // 1. Angle conversions & 1-deg integer quantization
     CHECK(std::abs(normalizedToDegrees(0.0) - (-180.0)) < 1e-9);
     CHECK(std::abs(normalizedToDegrees(0.5) - 0.0) < 1e-9);
     CHECK(std::abs(normalizedToDegrees(1.0) - 180.0) < 1e-9);
     CHECK(std::abs(degreesToNormalized(-180.0) - 0.0) < 1e-9);
     CHECK(std::abs(degreesToNormalized(0.0) - 0.5) < 1e-9);
     CHECK(std::abs(degreesToNormalized(180.0) - 1.0) < 1e-9);
+    CHECK(normalizedToIntDegrees(0.0) == -180);
+    CHECK(normalizedToIntDegrees(0.5) == 0);
+    CHECK(normalizedToIntDegrees(1.0) == 180);
+    CHECK(normalizedToIntDegrees(degreesToNormalized(37.4)) == 37);
+    CHECK(normalizedToIntDegrees(degreesToNormalized(-37.6)) == -38);
+    CHECK(std::abs(quantizeNormalizedToIntDegrees(degreesToNormalized(37.4)) - intDegreesToNormalized(37)) < 1e-12);
     CHECK(std::abs(normalizedToRadians(0.5) - 0.0) < 1e-9);
     CHECK(std::abs(normalizedToRadians(0.75) - (kPi * 0.5)) < 1e-9);
 
