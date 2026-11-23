@@ -147,26 +147,28 @@ def main(dll_path: str):
         assert abs(rack.get(inst0, 0) - 0.5) < 1e-6
 
         # 5 ms smoothing on set(0.75 -> +90 deg) at 48 kHz (240 samples)
+        # Under z = L + iR: outL = L*cos(w) - R*sin(w), outR = R*cos(w) + L*sin(w)
         assert rack.set(inst0, 0, 0.75) == 1
         smooth_buf = (c.c_float * (300 * 2))(*([0.6, 0.2] * 300))
         rack.process(inst0, smooth_buf, None, 300, 120.0)
-        # First sample must be mid-transition (not jumped to +90 deg outL=0.2, outR=-0.6)
-        assert smooth_buf[0] > 0.59 and -0.59 < smooth_buf[1] < 0.199
-        # Sample 120 (halfway through 240-sample 5ms ramp -> +45 deg): outL = (0.6+0.2)/sqrt(2), outR = (0.2-0.6)/sqrt(2)
-        assert abs(smooth_buf[119 * 2] - (0.8 / math.sqrt(2.0))) < 1e-3
-        assert abs(smooth_buf[119 * 2 + 1] - (-0.4 / math.sqrt(2.0))) < 1e-3
-        # Sample 299 (after 240-sample 5ms ramp) must be settled at +90 deg: outL = R = 0.2, outR = -L = -0.6
-        assert abs(smooth_buf[299 * 2] - 0.2) < 1e-5
-        assert abs(smooth_buf[299 * 2 + 1] - (-0.6)) < 1e-5
+        # First sample must be mid-transition (not jumped to +90 deg outL=-0.2, outR=0.6)
+        assert -0.19 < smooth_buf[0] < 0.599 and smooth_buf[1] > 0.201
+        # Sample 120 (halfway through 240-sample 5ms ramp -> +45 deg): outL = (0.6-0.2)/sqrt(2), outR = (0.2+0.6)/sqrt(2)
+        assert abs(smooth_buf[119 * 2] - (0.4 / math.sqrt(2.0))) < 1e-3
+        assert abs(smooth_buf[119 * 2 + 1] - (0.8 / math.sqrt(2.0))) < 1e-3
+        # Sample 299 (after 240-sample 5ms ramp) must be settled at +90 deg: outL = -R = -0.2, outR = L = 0.6
+        assert abs(smooth_buf[299 * 2] - (-0.2)) < 1e-5
+        assert abs(smooth_buf[299 * 2 + 1] - 0.6) < 1e-5
 
         # Mono transport (channels == 1): reads stereo[2*i] as mono L=R and rotates across stereo output
+        # Under z = L + iR at +45 deg (0.625): mono L=R=1/sqrt(2) -> outL = 0.0, outR = 1.0
         assert rack.set(inst1, 0, 0.625) == 1  # +45 deg
         assert rack.prepare(inst1, 48000, 64, 1, c.byref(latency)) == 1
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
         mono_buf = (c.c_float * 4)(inv_sqrt2, -999.0, inv_sqrt2, 999.0)
         rack.process(inst1, mono_buf, None, 2, 120.0)
-        assert abs(mono_buf[0] - 1.0) < 1e-5
-        assert abs(mono_buf[1] - 0.0) < 1e-5
+        assert abs(mono_buf[0] - 0.0) < 1e-5
+        assert abs(mono_buf[1] - 1.0) < 1e-5
 
         # Visual telemetry gating & sample stream
         vis_out = (c.c_float * 64)()
@@ -176,8 +178,8 @@ def main(dll_path: str):
         rack.process(inst0, vis_in, None, 4, 120.0)
         n_floats = rack.visual(inst0, vis_out, 64)
         assert n_floats == 8
-        # At +90 deg, outL = 0.2, outR = -0.6; visual emits interleaved (outR, outL)
-        assert abs(vis_out[0] - (-0.6)) < 1e-5 and abs(vis_out[1] - 0.2) < 1e-5
+        # At +90 deg under z = L + iR, outL = -0.2, outR = 0.6; visual emits interleaved (outR, outL)
+        assert abs(vis_out[0] - 0.6) < 1e-5 and abs(vis_out[1] - (-0.2)) < 1e-5
         rack.visual_active(inst0, 0)
         assert rack.visual(inst0, vis_out, 64) == 0
 
@@ -278,6 +280,19 @@ def main(dll_path: str):
             # Fire WM_TIMER (0x0113, timer id 1) to pull sampled points from live_inst and fade scatter points
             user32.SendMessageW(child_hwnd, 0x0113, 1, 0)
             user32.SendMessageW(child_hwnd, 0x0113, 1, 0)
+            user32.UpdateWindow(child_hwnd)
+            pump_messages()
+
+            # Click the collapse toggle button (top-right of scope card header: logical x~372, y~31 -> pixel x=465, y=39 at scale 1.25)
+            lparam_toggle = (39 << 16) | (465 & 0xFFFF)
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (collapse)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
+            user32.UpdateWindow(child_hwnd)
+            pump_messages()
+
+            # Click the collapse toggle button again to expand back
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (expand)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
             user32.UpdateWindow(child_hwnd)
             pump_messages()
 

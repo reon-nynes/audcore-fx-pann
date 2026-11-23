@@ -32,22 +32,28 @@ int main() {
     CHECK(std::abs(normalizedToRadians(0.5) - 0.0) < 1e-9);
     CHECK(std::abs(normalizedToRadians(0.75) - (kPi * 0.5)) < 1e-9);
 
-    // 2. Complex stereo rotation f(z) = z * exp(i * omega) with z = R + iL
+    // 2. Complex stereo rotation f(z) = z * exp(i * omega) with z = L + iR
+    // z_out = (L + iR)(cos w + i sin w) = (L cos w - R sin w) + i(L sin w + R cos w)
+    // outL = L cos w - R sin w, outR = R cos w + L sin w
     {
         auto [l0, r0] = rotateStereo(0.6f, -0.3f, 0.0);
         CHECK(std::abs(l0 - 0.6f) < 1e-6f && std::abs(r0 - (-0.3f)) < 1e-6f);
 
-        // +90 deg (+pi/2): outL = R, outR = -L
+        // +90 deg (+pi/2): outL = -R, outR = L
         auto [l90, r90] = rotateStereo(0.6f, 0.2f, kPi * 0.5);
-        CHECK(std::abs(l90 - 0.2f) < 1e-5f && std::abs(r90 - (-0.6f)) < 1e-5f);
+        CHECK(std::abs(l90 - (-0.2f)) < 1e-5f && std::abs(r90 - 0.6f) < 1e-5f);
 
         // +180 deg (+pi): outL = -L, outR = -R
         auto [l180, r180] = rotateStereo(0.6f, -0.2f, kPi);
         CHECK(std::abs(l180 - (-0.6f)) < 1e-5f && std::abs(r180 - 0.2f) < 1e-5f);
 
-        // +45 deg on mono L=R=1/sqrt(2) -> outL = 1.0, outR = 0.0
+        // +45 deg on mono L=R=1/sqrt(2) -> outL = 0.0, outR = 1.0 (pans Right)
         auto [l45, r45] = rotateStereo(kInvSqrt2, kInvSqrt2, kPi * 0.25);
-        CHECK(std::abs(l45 - 1.0f) < 1e-5f && std::abs(r45 - 0.0f) < 1e-5f);
+        CHECK(std::abs(l45 - 0.0f) < 1e-5f && std::abs(r45 - 1.0f) < 1e-5f);
+
+        // -45 deg on mono L=R=1/sqrt(2) -> outL = 1.0, outR = 0.0 (pans Left)
+        auto [lm45, rm45] = rotateStereo(kInvSqrt2, kInvSqrt2, -kPi * 0.25);
+        CHECK(std::abs(lm45 - 1.0f) < 1e-5f && std::abs(rm45 - 0.0f) < 1e-5f);
     }
 
     // 3. 45-deg CCW Lissajous projection: mono (r==l) is vertical (rx == 0, ry > 0)
@@ -89,17 +95,17 @@ int main() {
         CHECK(out[510] == 9999.0f && out[511] == -9999.0f);
     }
 
-    // 6. ScopeHistory stride downsampling (>512 pts), fadeTick, & NaN sanitization
+    // 6. ScopeHistory dense capacity (2048 pts), stride downsampling (>2048 pts), fadeTick, & NaN sanitization
     {
         ScopeHistory hist;
-        std::vector<float> batch(2048, 0.5f); // 1024 points -> stride 2 -> 512 points stored
+        std::vector<float> batch(8192, 0.5f); // 4096 points -> stride 2 -> 2048 points stored
         batch[4] = std::numeric_limits<float>::quiet_NaN();
         hist.pushInterleavedRL(batch.data(), batch.size());
-        CHECK(hist.count() == 512);
+        CHECK(hist.count() == 2048);
         CHECK(!std::isfinite(hist.pointAt(1).r) && !std::isfinite(hist.pointAt(1).l));
-        const float alphaBefore = hist.scatterPointAt(511).alpha;
+        const float alphaBefore = hist.scatterPointAt(2047).alpha;
         CHECK(hist.fadeTick(0.86f));
-        CHECK(hist.scatterPointAt(511).alpha < alphaBefore);
+        CHECK(hist.scatterPointAt(2047).alpha < alphaBefore);
     }
 
     std::printf("All PannTests passed.\n");

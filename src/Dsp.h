@@ -51,19 +51,19 @@ inline double normalizedToRadians(double norm) noexcept {
     return (2.0 * std::clamp(norm, 0.0, 1.0) - 1.0) * kPi;
 }
 
-// Complex stereo rotation f(z) = z * exp(i * omega) under z = R + iL:
-// z_in  = R + i * L
-// z_out = (R + i * L) * (cos(w) + i * sin(w))
-//       = (R * cos(w) - L * sin(w)) + i * (L * cos(w) + R * sin(w))
-// Re(z_out) = outR = R * cos(w) - L * sin(w)
-// Im(z_out) = outL = L * cos(w) + R * sin(w)
+// Complex stereo rotation f(z) = z * exp(i * omega) under z = L + iR:
+// z_in  = L + i * R
+// z_out = (L + i * R) * (cos(w) + i * sin(w))
+//       = (L * cos(w) - R * sin(w)) + i * (L * sin(w) + R * cos(w))
+// Re(z_out) = outL = L * cos(w) - R * sin(w)
+// Im(z_out) = outR = R * cos(w) + L * sin(w)
 inline std::pair<float, float> rotateStereo(float inL, float inR, double omegaRad) noexcept {
     const double c = std::cos(omegaRad);
     const double s = std::sin(omegaRad);
     const double l = static_cast<double>(inL);
     const double r = static_cast<double>(inR);
-    const double outR = r * c - l * s;
-    const double outL = l * c + r * s;
+    const double outL = l * c - r * s;
+    const double outR = r * c + l * s;
     return {static_cast<float>(outL), static_cast<float>(outR)};
 }
 
@@ -252,7 +252,7 @@ private:
 // Rolling scatter-point buffer with smooth per-frame exponential alpha decay.
 class ScopeHistory {
 public:
-    static constexpr int kHistorySize = 512;
+    static constexpr int kHistorySize = 2048;
     static constexpr int kNumBuckets = 8;
 
     void clear() noexcept {
@@ -260,9 +260,9 @@ public:
         validCount_ = 0;
     }
 
-    // Fades all existing points by decayFactor (e.g. 0.86 per 16ms frame) so points fade out
+    // Fades all existing points by decayFactor (e.g. 0.88 per 16ms frame) so points fade out
     // smoothly even when no new samples arrive.
-    bool fadeTick(float decayFactor = 0.86f) noexcept {
+    bool fadeTick(float decayFactor = 0.88f) noexcept {
         bool anyVisible = false;
         for (int i = 0; i < validCount_; ++i) {
             auto& pt = history_[static_cast<size_t>(i)];
@@ -282,9 +282,9 @@ public:
             return;
         }
 
-        // Age existing points slightly when a new batch arrives
+        // Age existing points gently when a new batch arrives so dense scatter trails persist smoothly
         for (int i = 0; i < validCount_; ++i) {
-            history_[static_cast<size_t>(i)].alpha *= 0.88f;
+            history_[static_cast<size_t>(i)].alpha *= 0.93f;
         }
 
         const int stride = (numPts > kHistorySize) ? ((numPts + kHistorySize - 1) / kHistorySize) : 1;
@@ -294,10 +294,10 @@ public:
         for (int i = 0; i < numPts; i += stride) {
             const float r = values[2 * i];
             const float l = values[2 * i + 1];
-            // Ramp initial alpha across the incoming batch from 0.45 (older in batch) to 1.0 (newest)
+            // Ramp initial alpha across the incoming batch from 0.55 (older in batch) to 1.0 (newest)
             const float batchFrac =
                 static_cast<float>(keptIdx + 1) / static_cast<float>(keptTotal);
-            const float initAlpha = 0.45f + 0.55f * batchFrac;
+            const float initAlpha = 0.55f + 0.45f * batchFrac;
             ++keptIdx;
 
             if (!std::isfinite(r) || !std::isfinite(l)) {
@@ -344,6 +344,7 @@ private:
 struct SharedScopeState {
     ScopeRingBuffer ringBuffer;
     std::atomic<uint32_t> sampleRate{48000};
+    std::atomic<int> scopeEnabled{1};
 };
 
 std::shared_ptr<SharedScopeState> scopeStateFor(uint32_t id);

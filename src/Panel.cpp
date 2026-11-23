@@ -35,6 +35,7 @@ constexpr UINT kScopeTimerMs = 16; // ~60 FPS
 const Color kBgMain(0xff0e1116);
 const Color kBgCard(0xff161b24);
 const Color kBgField(0xff0a0d12);
+const Color kBgSurfaceHover(0xff1d2430);
 const Color kBorderHairline(0xff263040);
 const Color kBorderActive(0xff3b4c66);
 const Color kTextPrimary(0xffe6edf3);
@@ -45,11 +46,13 @@ const Color kAmberTrace(0xfff59e0b);
 struct Words {
     const wchar_t* scopeTitle;
     const wchar_t* rotationLabel;
+    const wchar_t* collapseLabel;
+    const wchar_t* expandLabel;
 };
 
-constexpr Words kChinese{L"声场相位", L"旋转角度"};
-constexpr Words kEnglish{L"声场相位", L"ROTATION"};
-constexpr Words kJapanese{L"声场相位", L"回転角度"};
+constexpr Words kChinese{L"声场相位", L"旋转角度", L"收起", L"展开"};
+constexpr Words kEnglish{L"声场相位", L"ROTATION", L"Hide", L"Show"};
+constexpr Words kJapanese{L"声场相位", L"回転角度", L"隠す", L"表示"};
 
 struct Box {
     float x = 0.0f;
@@ -206,10 +209,13 @@ class Panel {
     double normalizedAngle_ = 0.5; // 0 deg
     bool draggingSlider_ = false;
     bool hoveringSlider_ = false;
+    bool hoveringToggle_ = false;
+    bool scopeCollapsed_ = false;
     bool trackingLeave_ = false;
     bool updatingEditText_ = false;
 
     Box scopeCardBox_{};
+    Box toggleBtnBox_{};
     Box sliderCardBox_{};
     Box editFrameBox_{};
     Box editInnerBox_{};
@@ -219,7 +225,7 @@ class Panel {
     ScopeHistory history_;
     std::shared_ptr<SharedScopeState> liveScope_;
     uint32_t liveReadCursor_ = 0;
-    std::array<float, 256> timerScratch_{}; // Up to 128 sampled points per 16ms frame
+    std::array<float, 1024> timerScratch_{}; // Up to 512 dense sampled points per 16ms frame
 
 public:
     Panel(HWND parentWindow, AudcoreFxEdit callback, void* context) noexcept
@@ -320,6 +326,9 @@ public:
         SetWindowSubclass(edit_, editSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
 
         liveScope_ = latestScopeState();
+        if (liveScope_) {
+            liveScope_->scopeEnabled.store(1, std::memory_order_relaxed);
+        }
         syncEditBoxText();
         resize(initW, initH, initialScale);
         SetTimer(window_, kScopeTimerId, kScopeTimerMs, nullptr);
@@ -377,7 +386,7 @@ public:
     }
 
     void visual(const float* values, size_t count) {
-        if (!values || count < 2) {
+        if (scopeCollapsed_ || !values || count < 2) {
             return;
         }
         history_.pushInterleavedRL(values, count);
@@ -410,9 +419,44 @@ private:
         }
     }
 
-    void onTimerTick() noexcept {
+    void toggleScopeCollapsed() noexcept {
+        scopeCollapsed_ = !scopeCollapsed_;
         if (!liveScope_) {
             liveScope_ = latestScopeState();
+        }
+        if (scopeCollapsed_) {
+            // Stop all UI timer ticks, clear scatter history, and stop audio-thread scope sampling
+            if (window_) {
+                KillTimer(window_, kScopeTimerId);
+            }
+            if (liveScope_) {
+                liveScope_->scopeEnabled.store(0, std::memory_order_relaxed);
+                liveScope_->ringBuffer.reset();
+            }
+            history_.clear();
+        } else {
+            // Resume audio-thread scope sampling and 60 FPS UI timer
+            if (liveScope_) {
+                liveScope_->ringBuffer.reset();
+                liveScope_->scopeEnabled.store(1, std::memory_order_relaxed);
+            }
+            if (window_) {
+                SetTimer(window_, kScopeTimerId, kScopeTimerMs, nullptr);
+            }
+        }
+        updateLayout();
+        invalidate();
+    }
+
+    void onTimerTick() noexcept {
+        if (scopeCollapsed_) {
+            return;
+        }
+        if (!liveScope_) {
+            liveScope_ = latestScopeState();
+            if (liveScope_) {
+                liveScope_->scopeEnabled.store(1, std::memory_order_relaxed);
+            }
         }
         uint32_t poppedFloats = 0;
         if (liveScope_) {
@@ -422,7 +466,7 @@ private:
         if (poppedFloats >= 2) {
             history_.pushInterleavedRL(timerScratch_.data(), poppedFloats);
             invalidate();
-        } else if (history_.fadeTick(0.86f)) {
+        } else if (history_.fadeTick(0.88f)) {
             invalidate();
         }
     }
@@ -470,22 +514,37 @@ private:
         const float footerHeight = 20.0f;
         const float sliderCardH = 74.0f;
         const float gap = 10.0f;
+        const float collapsedScopeH = 38.0f;
 
         const float contentW = std::max(60.0f, width_ - 2.0f * margin);
-        const float sliderY = std::max(margin + 80.0f, height_ - footerHeight - sliderCardH - 4.0f);
 
-        scopeCardBox_ = Box{
-            margin,
-            margin,
-            contentW,
-            std::max(60.0f, sliderY - gap - margin)
-        };
+        if (scopeCollapsed_) {
+            scopeCardBox_ = Box{margin, margin, contentW, collapsedScopeH};
+            sliderCardBox_ = Box{margin, margin + collapsedScopeH + gap, contentW, sliderCardH};
+        } else {
+            const float sliderY = std::max(margin + 80.0f, height_ - footerHeight - sliderCardH - 4.0f);
+            scopeCardBox_ = Box{
+                margin,
+                margin,
+                contentW,
+                std::max(60.0f, sliderY - gap - margin)
+            };
+            sliderCardBox_ = Box{
+                margin,
+                sliderY,
+                contentW,
+                sliderCardH
+            };
+        }
 
-        sliderCardBox_ = Box{
-            margin,
-            sliderY,
-            contentW,
-            sliderCardH
+        // Collapse toggle button to the right of "声场相位" title inside scopeCardBox_ header
+        const float toggleW = 54.0f;
+        const float toggleH = 22.0f;
+        toggleBtnBox_ = Box{
+            scopeCardBox_.x + scopeCardBox_.w - 10.0f - toggleW,
+            scopeCardBox_.y + 8.0f,
+            toggleW,
+            toggleH
         };
 
         // Top-right integer input box inside sliderCardBox_
@@ -579,8 +638,8 @@ private:
             paintWatermark(g);
         }
 
-        // Fast direct-pixel scatter plot rendering via LockBits (sub-0.05ms for 512 points)
-        if (halfUnit > 4.0f && history_.count() > 0) {
+        // Fast direct-pixel scatter plot rendering via LockBits (skipped completely when collapsed)
+        if (!scopeCollapsed_ && halfUnit > 4.0f && history_.count() > 0) {
             paintScatterPointsFast(pixelW, pixelH, plotRect, cx, cy, halfUnit);
         }
 
@@ -606,12 +665,10 @@ private:
         };
 
         const Box headerBounds{inner.x, inner.y, inner.w, 22.0f};
-        inner.y += 26.0f;
-        inner.h = std::max(0.0f, inner.h - 26.0f);
 
-        // Header dot + "声场相位" title only (clean and minimal)
+        // Header dot (amber when active, dim when collapsed) + "声场相位" title + collapse toggle button
         const float dotSize = 7.0f;
-        SolidBrush dotBrush(kAmberTrace);
+        SolidBrush dotBrush(scopeCollapsed_ ? kTextDim : kAmberTrace);
         g.FillEllipse(
             &dotBrush,
             headerBounds.x,
@@ -622,12 +679,60 @@ private:
         drawLabel(
             g,
             words_->scopeTitle,
-            Box{headerBounds.x + dotSize + 7.0f, headerBounds.y, std::max(10.0f, headerBounds.w - 20.0f), headerBounds.h},
+            Box{headerBounds.x + dotSize + 7.0f, headerBounds.y, std::max(10.0f, headerBounds.w - 75.0f), headerBounds.h},
             13.0f,
             kTextPrimary,
             true,
             false,
             StringAlignmentNear);
+
+        // Collapse / Expand toggle button on the right of "声场相位"
+        fillRoundRect(
+            g,
+            toggleBtnBox_,
+            hoveringToggle_ ? kBgSurfaceHover : kBgField,
+            4.0f);
+        drawRoundRect(
+            g,
+            toggleBtnBox_,
+            hoveringToggle_ ? kBorderActive : kBorderHairline,
+            4.0f,
+            1.0f);
+
+        drawLabel(
+            g,
+            scopeCollapsed_ ? words_->expandLabel : words_->collapseLabel,
+            Box{toggleBtnBox_.x + 6.0f, toggleBtnBox_.y, toggleBtnBox_.w - 20.0f, toggleBtnBox_.h},
+            11.0f,
+            hoveringToggle_ ? kTextPrimary : kTextSecondary,
+            false,
+            false,
+            StringAlignmentCenter);
+
+        // Draw crisp chevron arrow inside toggleBtnBox_
+        {
+            const float chevCx = toggleBtnBox_.x + toggleBtnBox_.w - 10.0f;
+            const float chevCy = toggleBtnBox_.y + toggleBtnBox_.h * 0.5f;
+            Pen chevPen(hoveringToggle_ ? kTextPrimary : kTextSecondary, 1.4f);
+            chevPen.SetStartCap(LineCapRound);
+            chevPen.SetEndCap(LineCapRound);
+            if (scopeCollapsed_) {
+                // Downward chevron (expand)
+                g.DrawLine(&chevPen, chevCx - 3.5f, chevCy - 1.5f, chevCx, chevCy + 2.0f);
+                g.DrawLine(&chevPen, chevCx, chevCy + 2.0f, chevCx + 3.5f, chevCy - 1.5f);
+            } else {
+                // Upward chevron (collapse)
+                g.DrawLine(&chevPen, chevCx - 3.5f, chevCy + 1.5f, chevCx, chevCy - 2.0f);
+                g.DrawLine(&chevPen, chevCx, chevCy - 2.0f, chevCx + 3.5f, chevCy + 1.5f);
+            }
+        }
+
+        if (scopeCollapsed_) {
+            return;
+        }
+
+        inner.y += 26.0f;
+        inner.h = std::max(0.0f, inner.h - 26.0f);
 
         // Centered 1:1 square viewport
         const float side = std::floor(std::min(inner.w, inner.h));
@@ -677,25 +782,25 @@ private:
             g.DrawLine(&crossPen, cx, plotRect.y + 2.0f, cx, plotRect.y + plotRect.h - 2.0f);
         }
 
-        // Prominent 45 deg CCW rotated L (+135 deg top-left) and R (+45 deg top-right) axes
+        // Prominent 45 deg CCW rotated L (-45 deg top-left) and R (+45 deg top-right) axes
         // plus crisp perpendicular tick marks at both 45 deg unit-circle intersections
         {
             const float diagReach = halfUnit * 0.76f;
             Pen diagPen(withAlpha(kBorderHairline, 0.90f), 1.0f);
-            // R / Re axis: bottom-left to top-right (+45 deg)
+            // R axis: bottom-left to top-right (+45 deg)
             g.DrawLine(&diagPen, cx - diagReach, cy + diagReach, cx + diagReach, cy - diagReach);
-            // L / Im axis: bottom-right to top-left (+135 deg)
+            // L axis: bottom-right to top-left (-45 deg)
             g.DrawLine(&diagPen, cx + diagReach, cy + diagReach, cx - diagReach, cy - diagReach);
 
-            // Perpendicular ticks at +/-45 deg on the unit circle (far left L and far right R)
+            // Perpendicular ticks at +/-45 deg on the unit circle (typical far left L and far right R)
             const float u45 = halfUnit * kInvSqrt2;
             const float tickHalf = 4.5f * kInvSqrt2;
             Pen tick45Pen(withAlpha(kAmberTrace, 0.75f), 1.4f);
-            // Top-Left (+45 deg CCW from M -> Far Left L): point is (cx - u45, cy - u45), tangent is (1, -1)/sqrt(2)
+            // Top-Left (-45 deg -> Far Left L): point is (cx - u45, cy - u45)
             g.DrawLine(&tick45Pen,
                        (cx - u45) - tickHalf, (cy - u45) + tickHalf,
                        (cx - u45) + tickHalf, (cy - u45) - tickHalf);
-            // Top-Right (-45 deg CW from M -> Far Right R): point is (cx + u45, cy - u45), tangent is (1, 1)/sqrt(2)
+            // Top-Right (+45 deg -> Far Right R): point is (cx + u45, cy - u45)
             g.DrawLine(&tick45Pen,
                        (cx + u45) - tickHalf, (cy - u45) - tickHalf,
                        (cx + u45) + tickHalf, (cy - u45) + tickHalf);
@@ -750,7 +855,7 @@ private:
 
             // Age-weighted fade combined with per-point exponential decay
             const float orderFrac = static_cast<float>(i + 1) / static_cast<float>(validCount);
-            const float effAlpha = std::clamp(pt.alpha * (0.25f + 0.75f * orderFrac), 0.0f, 1.0f);
+            const float effAlpha = std::clamp(pt.alpha * (0.20f + 0.80f * orderFrac), 0.0f, 1.0f);
             if (effAlpha < 0.025f) {
                 continue;
             }
@@ -760,8 +865,8 @@ private:
             const int y = static_cast<int>(std::lround(pxCy - ry * pxHalfUnit));
 
             const uint8_t coreA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 245.0f), 0, 255));
-            const uint8_t ringA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 135.0f), 0, 255));
-            const uint8_t diagA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 65.0f), 0, 255));
+            const uint8_t ringA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 130.0f), 0, 255));
+            const uint8_t diagA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 60.0f), 0, 255));
 
             // 3x3 soft anti-aliased glowing scatter point
             blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x, y, kAmberR, kAmberG, kAmberB, coreA);
@@ -845,13 +950,13 @@ private:
         drawRoundRect(g, sliderTrackBox_, kBorderHairline, 3.0f, 1.0f);
 
         const float centerX = sliderTrackBox_.x + sliderTrackBox_.w * 0.5f;
-        const float left45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.375f;  // -45 deg
-        const float right45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.625f; // +45 deg
+        const float left45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.375f;  // -45 deg (typical far left)
+        const float right45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.625f; // +45 deg (typical far right)
         const float thumbX =
             sliderTrackBox_.x + sliderTrackBox_.w * static_cast<float>(std::clamp(normalizedAngle_, 0.0, 1.0));
         const float trackCenterY = sliderTrackBox_.y + sliderTrackBox_.h * 0.5f;
 
-        // Ticks at -45 deg (typical far right), 0 deg (center), and +45 deg (typical far left)
+        // Ticks at -45 deg (typical far left), 0 deg (center), and +45 deg (typical far right)
         {
             Pen centerTickPen(kBorderActive, 1.2f);
             g.DrawLine(&centerTickPen, centerX, sliderTrackBox_.y - 4.0f, centerX, sliderTrackBox_.y + sliderTrackBox_.h + 4.0f);
@@ -1015,6 +1120,11 @@ private:
             case WM_LBUTTONDOWN: {
                 const float lx = static_cast<float>(GET_X_LPARAM(lParam)) / self->scale_;
                 const float ly = static_cast<float>(GET_Y_LPARAM(lParam)) / self->scale_;
+                if (self->toggleBtnBox_.contains(lx, ly)) {
+                    SetFocus(hwnd);
+                    self->toggleScopeCollapsed();
+                    return 0;
+                }
                 if (self->editFrameBox_.contains(lx, ly) && self->edit_) {
                     SetFocus(self->edit_);
                     SendMessageW(self->edit_, EM_SETSEL, 0, -1);
@@ -1046,9 +1156,11 @@ private:
                 if (self->draggingSlider_) {
                     self->setAngleInteractive(self->normalizedFromLogicalX(lx));
                 } else {
-                    const bool hot = self->sliderHitBox_.contains(lx, ly);
-                    if (hot != self->hoveringSlider_) {
-                        self->hoveringSlider_ = hot;
+                    const bool hotSlider = self->sliderHitBox_.contains(lx, ly);
+                    const bool hotToggle = self->toggleBtnBox_.contains(lx, ly);
+                    if (hotSlider != self->hoveringSlider_ || hotToggle != self->hoveringToggle_) {
+                        self->hoveringSlider_ = hotSlider;
+                        self->hoveringToggle_ = hotToggle;
                         self->invalidate();
                     }
                 }
@@ -1078,6 +1190,10 @@ private:
             case WM_RBUTTONDOWN: {
                 const float lx = static_cast<float>(GET_X_LPARAM(lParam)) / self->scale_;
                 const float ly = static_cast<float>(GET_Y_LPARAM(lParam)) / self->scale_;
+                if (message == WM_LBUTTONDBLCLK && self->toggleBtnBox_.contains(lx, ly)) {
+                    self->toggleScopeCollapsed();
+                    return 0;
+                }
                 if (!self->editFrameBox_.contains(lx, ly)
                     && (self->sliderHitBox_.contains(lx, ly) || self->sliderCardBox_.contains(lx, ly))) {
                     self->resetToCenter();
@@ -1097,8 +1213,9 @@ private:
 
             case WM_MOUSELEAVE: {
                 self->trackingLeave_ = false;
-                if (self->hoveringSlider_) {
+                if (self->hoveringSlider_ || self->hoveringToggle_) {
                     self->hoveringSlider_ = false;
+                    self->hoveringToggle_ = false;
                     self->invalidate();
                 }
                 return 0;

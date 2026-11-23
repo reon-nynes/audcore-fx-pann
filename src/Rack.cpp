@@ -21,7 +21,7 @@ constexpr float kDefaultNormalized = 0.5f; // 0 deg
 constexpr uint8_t kStateVersion = 1u;
 constexpr uint32_t kStateBytes = 5u;
 constexpr uint32_t kMaxVisualFloatsPerPoll = 1024u; // 512 stereo points
-constexpr uint32_t kTargetScatterPointsPerSec = 4800u; // ~80 points per 60 FPS frame
+constexpr uint32_t kTargetScatterPointsPerSec = 24000u; // ~400 dense scatter points per 60 FPS frame
 
 std::mutex gRegistryMutex;
 std::unordered_map<uint32_t, std::weak_ptr<SharedScopeState>> gRegistry;
@@ -112,6 +112,7 @@ void process(void* handle, float* stereo, const float* sidechain, uint32_t frame
     }
 
     const bool recordAbiVisual = rack->visualActive.load(std::memory_order_relaxed) != 0;
+    const bool sampleLiveScope = rack->scopeState->scopeEnabled.load(std::memory_order_relaxed) != 0;
     const uint32_t ch = rack->channels;
     auto& liveRing = rack->scopeState->ringBuffer;
 
@@ -124,9 +125,10 @@ void process(void* handle, float* stereo, const float* sidechain, uint32_t frame
         stereo[2 * i] = outL;
         stereo[2 * i + 1] = outR;
 
-        // Always sample decimated (R, L) points into the lock-free live scope ring
-        // so the 60 FPS custom editor follows the audio signal with zero lag.
-        liveRing.pushSampled(outR, outL);
+        // Only sample into the live scope ring when the Lissajous scope is expanded
+        if (sampleLiveScope) {
+            liveRing.pushSampled(outR, outL);
+        }
 
         if (recordAbiVisual) {
             rack->abiVisualRing.push(outR, outL);
