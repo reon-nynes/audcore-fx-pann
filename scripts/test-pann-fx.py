@@ -293,7 +293,7 @@ def main(dll_path: str):
             user32.GetClientRect(child_hwnd, c.byref(rect_before))
             assert rect_before.bottom == 600, f"Expected initial height 600, got {rect_before.bottom}"
 
-            lparam_toggle = (24 << 16) | (465 & 0xFFFF)
+            lparam_toggle = (38 << 16) | (465 & 0xFFFF)
             user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (collapse)
             user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
             rect_collapsed = w.RECT()
