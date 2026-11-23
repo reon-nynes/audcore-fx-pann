@@ -86,6 +86,7 @@ def main(dll_path: str):
     rack = rack_ptr.contents
     assert rack.code == b"PANN"
     assert rack.fuid == b"A1B2C3D4E5F647898A9B0C1D2E3F4A5B"
+    assert rack.version == b"0.1.2"
     assert rack.size == c.sizeof(Rack)
 
     library.audcore_fx_get_definition.argtypes = [u32, c.POINTER(u32)]
@@ -96,7 +97,7 @@ def main(dll_path: str):
     definition = json.loads(c.string_at(def_ptr, def_size.value))
     assert definition["code"] == "PANN"
     assert definition["fuid"] == rack.fuid.decode()
-    assert definition["vendor"] == "久嘉-Reon"
+    assert definition["vendor"] == "Nytera"
     assert definition["label"]["zh-CN"] == "声场旋转"
     assert len(definition["parameters"]) == 1
     param0 = definition["parameters"][0]

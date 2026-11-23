@@ -21,7 +21,7 @@ constexpr float kDefaultNormalized = 0.5f; // 0 deg
 constexpr uint8_t kStateVersion = 1u;
 constexpr uint32_t kStateBytes = 5u;
 constexpr uint32_t kMaxVisualFloatsPerPoll = 1024u; // 512 stereo points
-constexpr uint32_t kTargetScatterPointsPerSec = 24000u; // ~400 dense scatter points per 60 FPS frame
+constexpr uint32_t kTargetScatterPointsPerSec = 16000u; // ~267 scatter points per 60 FPS frame
 
 std::mutex gRegistryMutex;
 std::unordered_map<uint32_t, std::weak_ptr<SharedScopeState>> gRegistry;
