@@ -9,6 +9,7 @@
 #include <gdiplus.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,8 @@ constexpr wchar_t kWindowClass[] = L"Audcore.Pann.Panel.1";
 constexpr int32_t kDefaultWidth = 420;
 constexpr int32_t kDefaultHeight = 480;
 constexpr float kThumbRadius = 7.0f;
+constexpr UINT_PTR kScopeTimerId = 1;
+constexpr UINT kScopeTimerMs = 16; // ~60 FPS
 
 // Nytera dark palette
 const Color kBgMain(0xff0e1116);
@@ -44,9 +47,9 @@ struct Words {
     const wchar_t* rotationLabel;
 };
 
-constexpr Words kChinese{L"声场相位 · POST LISSAJOUS", L"旋转角度"};
-constexpr Words kEnglish{L"POST LISSAJOUS", L"ROTATION"};
-constexpr Words kJapanese{L"位相スコープ · POST LISSAJOUS", L"回転角度"};
+constexpr Words kChinese{L"声场相位", L"旋转角度"};
+constexpr Words kEnglish{L"声场相位", L"ROTATION"};
+constexpr Words kJapanese{L"声场相位", L"回転角度"};
 
 struct Box {
     float x = 0.0f;
@@ -131,6 +134,33 @@ void drawLabel(Graphics& g,
     g.DrawString(text, -1, &font, rect, &format, &brush);
 }
 
+// Fast premultiplied-ARGB pixel blend into a locked 32bpp PARGB bitmap buffer
+inline void blendPixelPARGB(uint8_t* scan0,
+                            int stride,
+                            int clipX0,
+                            int clipY0,
+                            int clipX1,
+                            int clipY1,
+                            int x,
+                            int y,
+                            uint8_t srcR,
+                            uint8_t srcG,
+                            uint8_t srcB,
+                            uint8_t alpha) noexcept {
+    if (x < clipX0 || x >= clipX1 || y < clipY0 || y >= clipY1 || alpha == 0) {
+        return;
+    }
+    uint8_t* px = scan0 + y * stride + x * 4;
+    const uint32_t invA = 255u - alpha;
+    const uint32_t pB = (static_cast<uint32_t>(srcB) * alpha) / 255u;
+    const uint32_t pG = (static_cast<uint32_t>(srcG) * alpha) / 255u;
+    const uint32_t pR = (static_cast<uint32_t>(srcR) * alpha) / 255u;
+    px[0] = static_cast<uint8_t>(std::min<uint32_t>(255u, pB + (px[0] * invA) / 255u));
+    px[1] = static_cast<uint8_t>(std::min<uint32_t>(255u, pG + (px[1] * invA) / 255u));
+    px[2] = static_cast<uint8_t>(std::min<uint32_t>(255u, pR + (px[2] * invA) / 255u));
+    px[3] = 255u;
+}
+
 bool tryParseIntDegrees(const wchar_t* text, int& outDeg) noexcept {
     if (!text) {
         return false;
@@ -187,12 +217,18 @@ class Panel {
     Box sliderHitBox_{};
 
     ScopeHistory history_;
+    std::shared_ptr<SharedScopeState> liveScope_;
+    uint32_t liveReadCursor_ = 0;
+    std::array<float, 256> timerScratch_{}; // Up to 128 sampled points per 16ms frame
 
 public:
     Panel(HWND parentWindow, AudcoreFxEdit callback, void* context) noexcept
         : parent_(parentWindow), editCallback_(callback), editContext_(context) {}
 
     ~Panel() {
+        if (window_) {
+            KillTimer(window_, kScopeTimerId);
+        }
         if (edit_) {
             RemoveWindowSubclass(edit_, editSubclassProc, 1);
         }
@@ -283,8 +319,10 @@ public:
         SendMessageW(edit_, EM_SETLIMITTEXT, 8, 0);
         SetWindowSubclass(edit_, editSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
 
+        liveScope_ = latestScopeState();
         syncEditBoxText();
         resize(initW, initH, initialScale);
+        SetTimer(window_, kScopeTimerId, kScopeTimerMs, nullptr);
         return true;
     }
 
@@ -372,6 +410,23 @@ private:
         }
     }
 
+    void onTimerTick() noexcept {
+        if (!liveScope_) {
+            liveScope_ = latestScopeState();
+        }
+        uint32_t poppedFloats = 0;
+        if (liveScope_) {
+            poppedFloats = liveScope_->ringBuffer.popLatestWithCursor(
+                liveReadCursor_, timerScratch_.data(), static_cast<uint32_t>(timerScratch_.size()));
+        }
+        if (poppedFloats >= 2) {
+            history_.pushInterleavedRL(timerScratch_.data(), poppedFloats);
+            invalidate();
+        } else if (history_.fadeTick(0.86f)) {
+            invalidate();
+        }
+    }
+
     void syncEditBoxText() noexcept {
         if (!edit_) {
             return;
@@ -413,7 +468,7 @@ private:
     void updateLayout() noexcept {
         const float margin = 12.0f;
         const float footerHeight = 20.0f;
-        const float sliderCardH = 72.0f;
+        const float sliderCardH = 74.0f;
         const float gap = 10.0f;
 
         const float contentW = std::max(60.0f, width_ - 2.0f * margin);
@@ -452,7 +507,7 @@ private:
         const float trackSidePad = 48.0f;
         const float trackX = sliderCardBox_.x + trackSidePad;
         const float trackW = std::max(24.0f, sliderCardBox_.w - 2.0f * trackSidePad);
-        const float trackY = sliderCardBox_.y + 46.0f;
+        const float trackY = sliderCardBox_.y + 44.0f;
         sliderTrackBox_ = Box{trackX, trackY, trackW, 6.0f};
         sliderHitBox_ = Box{
             sliderTrackBox_.x - kThumbRadius - 4.0f,
@@ -506,6 +561,11 @@ private:
             backBuffer_ = std::make_unique<Bitmap>(pixelW, pixelH, PixelFormat32bppPARGB);
         }
 
+        Box plotRect{};
+        float cx = 0.0f;
+        float cy = 0.0f;
+        float halfUnit = 0.0f;
+
         {
             Graphics g(backBuffer_.get());
             g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -514,9 +574,14 @@ private:
             g.ScaleTransform(scale_, scale_);
             g.Clear(kBgMain);
 
-            paintScopeCard(g);
+            paintScopeGrid(g, plotRect, cx, cy, halfUnit);
             paintSliderCard(g);
             paintWatermark(g);
+        }
+
+        // Fast direct-pixel scatter plot rendering via LockBits (sub-0.05ms for 512 points)
+        if (halfUnit > 4.0f && history_.count() > 0) {
+            paintScatterPointsFast(pixelW, pixelH, plotRect, cx, cy, halfUnit);
         }
 
         Graphics output(dc);
@@ -529,7 +594,7 @@ private:
         output.DrawImage(backBuffer_.get(), 0, 0, pixelW, pixelH);
     }
 
-    void paintScopeCard(Graphics& g) {
+    void paintScopeGrid(Graphics& g, Box& outPlotRect, float& outCx, float& outCy, float& outHalfUnit) {
         fillRoundRect(g, scopeCardBox_, kBgCard, 6.0f);
         drawRoundRect(g, scopeCardBox_, kBorderHairline, 6.0f, 1.0f);
 
@@ -544,7 +609,7 @@ private:
         inner.y += 26.0f;
         inner.h = std::max(0.0f, inner.h - 26.0f);
 
-        // Header dot + title + "L 45 / R 45" scale hint
+        // Header dot + "声场相位" title only (clean and minimal)
         const float dotSize = 7.0f;
         SolidBrush dotBrush(kAmberTrace);
         g.FillEllipse(
@@ -557,22 +622,12 @@ private:
         drawLabel(
             g,
             words_->scopeTitle,
-            Box{headerBounds.x + dotSize + 7.0f, headerBounds.y, std::max(10.0f, headerBounds.w - 92.0f), headerBounds.h},
+            Box{headerBounds.x + dotSize + 7.0f, headerBounds.y, std::max(10.0f, headerBounds.w - 20.0f), headerBounds.h},
             13.0f,
             kTextPrimary,
             true,
             false,
             StringAlignmentNear);
-
-        drawLabel(
-            g,
-            L"L 45 / R 45",
-            Box{headerBounds.x + headerBounds.w - 78.0f, headerBounds.y, 78.0f, headerBounds.h},
-            10.5f,
-            kTextDim,
-            false,
-            true,
-            StringAlignmentFar);
 
         // Centered 1:1 square viewport
         const float side = std::floor(std::min(inner.w, inner.h));
@@ -601,6 +656,11 @@ private:
         const float cx = unitBox.x + halfUnit;
         const float cy = unitBox.y + halfUnit;
 
+        outPlotRect = plotRect;
+        outCx = cx;
+        outCy = cy;
+        outHalfUnit = halfUnit;
+
         // |z| = 0.5 inner circle & |z| = 1.0 unit circle
         {
             Pen innerCirclePen(withAlpha(kBorderHairline, 0.35f), 1.0f);
@@ -618,105 +678,107 @@ private:
         }
 
         // Prominent 45 deg CCW rotated L (+135 deg top-left) and R (+45 deg top-right) axes
+        // plus crisp perpendicular tick marks at both 45 deg unit-circle intersections
         {
-            const float diagReach = halfUnit * 1.04f;
-            Pen diagPen(withAlpha(kBorderHairline, 0.95f), 1.0f);
+            const float diagReach = halfUnit * 0.76f;
+            Pen diagPen(withAlpha(kBorderHairline, 0.90f), 1.0f);
             // R / Re axis: bottom-left to top-right (+45 deg)
             g.DrawLine(&diagPen, cx - diagReach, cy + diagReach, cx + diagReach, cy - diagReach);
             // L / Im axis: bottom-right to top-left (+135 deg)
             g.DrawLine(&diagPen, cx + diagReach, cy + diagReach, cx - diagReach, cy - diagReach);
+
+            // Perpendicular ticks at +/-45 deg on the unit circle (far left L and far right R)
+            const float u45 = halfUnit * kInvSqrt2;
+            const float tickHalf = 4.5f * kInvSqrt2;
+            Pen tick45Pen(withAlpha(kAmberTrace, 0.75f), 1.4f);
+            // Top-Left (+45 deg CCW from M -> Far Left L): point is (cx - u45, cy - u45), tangent is (1, -1)/sqrt(2)
+            g.DrawLine(&tick45Pen,
+                       (cx - u45) - tickHalf, (cy - u45) + tickHalf,
+                       (cx - u45) + tickHalf, (cy - u45) - tickHalf);
+            // Top-Right (-45 deg CW from M -> Far Right R): point is (cx + u45, cy - u45), tangent is (1, 1)/sqrt(2)
+            g.DrawLine(&tick45Pen,
+                       (cx + u45) - tickHalf, (cy - u45) - tickHalf,
+                       (cx + u45) + tickHalf, (cy - u45) + tickHalf);
         }
 
         // Axis labels: L at top-left, M at top-center, R at top-right
         drawLabel(g, L"L", Box{plotRect.x + 6.0f, plotRect.y + 4.0f, 20.0f, 12.0f}, 10.0f, kTextDim, false, true, StringAlignmentNear);
         drawLabel(g, L"R", Box{plotRect.x + plotRect.w - 26.0f, plotRect.y + 4.0f, 20.0f, 12.0f}, 10.0f, kTextDim, false, true, StringAlignmentFar);
         drawLabel(g, L"M", Box{cx - 10.0f, plotRect.y + 2.0f, 20.0f, 12.0f}, 10.0f, kTextDim, false, true, StringAlignmentCenter);
+    }
 
+    void paintScatterPointsFast(int pixelW,
+                                int pixelH,
+                                const Box& plotRect,
+                                float cx,
+                                float cy,
+                                float halfUnit) {
         const int validCount = history_.count();
-        if (validCount <= 0) {
+        if (validCount <= 0 || !backBuffer_) {
             return;
         }
 
-        const GraphicsState clipState = g.Save();
-        g.SetClip(RectF(plotRect.x + 1.0f, plotRect.y + 1.0f, plotRect.w - 2.0f, plotRect.h - 2.0f));
-
-        if (validCount == 1) {
-            const StereoPoint pt = history_.pointAt(0);
-            if (std::isfinite(pt.r) && std::isfinite(pt.l)) {
-                const auto [rx, ry] = rotate45CCW(pt.r, pt.l);
-                const float px = cx + rx * halfUnit;
-                const float py = cy - ry * halfUnit;
-                SolidBrush glowBrush(withAlpha(kAmberTrace, 0.25f));
-                g.FillEllipse(&glowBrush, px - 4.0f, py - 4.0f, 8.0f, 8.0f);
-                SolidBrush coreBrush(kAmberTrace);
-                g.FillEllipse(&coreBrush, px - 1.5f, py - 1.5f, 3.0f, 3.0f);
-            }
-            g.Restore(clipState);
+        const int clipX0 = std::clamp(static_cast<int>(std::ceil((plotRect.x + 1.0f) * scale_)), 0, pixelW);
+        const int clipY0 = std::clamp(static_cast<int>(std::ceil((plotRect.y + 1.0f) * scale_)), 0, pixelH);
+        const int clipX1 = std::clamp(static_cast<int>(std::floor((plotRect.x + plotRect.w - 1.0f) * scale_)), 0, pixelW);
+        const int clipY1 = std::clamp(static_cast<int>(std::floor((plotRect.y + plotRect.h - 1.0f) * scale_)), 0, pixelH);
+        if (clipX1 <= clipX0 || clipY1 <= clipY0) {
             return;
         }
 
-        const int numSegments = validCount - 1;
-        for (int bucket = 0; bucket < ScopeHistory::kNumBuckets; ++bucket) {
-            const int segStart = (bucket * numSegments) / ScopeHistory::kNumBuckets;
-            const int segEnd = ((bucket + 1) * numSegments) / ScopeHistory::kNumBuckets;
-            if (segEnd <= segStart) {
-                continue;
-            }
-
-            GraphicsPath path;
-            bool haveSubpath = false;
-            bool hasAnySegment = false;
-
-            for (int s = segStart; s < segEnd; ++s) {
-                const StereoPoint p0 = history_.pointAt(s);
-                const StereoPoint p1 = history_.pointAt(s + 1);
-                if (!std::isfinite(p0.r) || !std::isfinite(p0.l)
-                    || !std::isfinite(p1.r) || !std::isfinite(p1.l)) {
-                    haveSubpath = false;
-                    continue;
-                }
-
-                const auto [rx0, ry0] = rotate45CCW(p0.r, p0.l);
-                const auto [rx1, ry1] = rotate45CCW(p1.r, p1.l);
-                const float x0 = cx + rx0 * halfUnit;
-                const float y0 = cy - ry0 * halfUnit;
-                const float x1 = cx + rx1 * halfUnit;
-                const float y1 = cy - ry1 * halfUnit;
-
-                if (!haveSubpath) {
-                    path.StartFigure();
-                    haveSubpath = true;
-                }
-                path.AddLine(x0, y0, x1, y1);
-                hasAnySegment = true;
-            }
-
-            if (!hasAnySegment) {
-                continue;
-            }
-
-            const float ageFrac =
-                static_cast<float>(bucket + 1) / static_cast<float>(ScopeHistory::kNumBuckets);
-            const float alpha = 0.06f + 0.89f * (ageFrac * ageFrac);
-            const float strokeWidth = 1.0f + 0.85f * ageFrac;
-
-            if (bucket >= ScopeHistory::kNumBuckets - 2) {
-                const float glowAlpha = (bucket == ScopeHistory::kNumBuckets - 1) ? 0.22f : 0.10f;
-                Pen glowPen(withAlpha(kAmberTrace, glowAlpha), strokeWidth + 2.8f);
-                glowPen.SetStartCap(LineCapRound);
-                glowPen.SetEndCap(LineCapRound);
-                glowPen.SetLineJoin(LineJoinRound);
-                g.DrawPath(&glowPen, &path);
-            }
-
-            Pen tracePen(withAlpha(kAmberTrace, alpha), strokeWidth);
-            tracePen.SetStartCap(LineCapRound);
-            tracePen.SetEndCap(LineCapRound);
-            tracePen.SetLineJoin(LineJoinRound);
-            g.DrawPath(&tracePen, &path);
+        Rect lockRect(0, 0, pixelW, pixelH);
+        BitmapData bmpData{};
+        if (backBuffer_->LockBits(&lockRect, ImageLockModeRead | ImageLockModeWrite, PixelFormat32bppPARGB, &bmpData) != Ok) {
+            return;
         }
 
-        g.Restore(clipState);
+        auto* scan0 = static_cast<uint8_t*>(bmpData.Scan0);
+        const int stride = bmpData.Stride;
+        const float pxCx = cx * scale_;
+        const float pxCy = cy * scale_;
+        const float pxHalfUnit = halfUnit * scale_;
+
+        constexpr uint8_t kAmberR = 0xf5;
+        constexpr uint8_t kAmberG = 0x9e;
+        constexpr uint8_t kAmberB = 0x0b;
+
+        for (int i = 0; i < validCount; ++i) {
+            const ScatterPoint pt = history_.scatterPointAt(i);
+            if (!std::isfinite(pt.r) || !std::isfinite(pt.l) || pt.alpha < 0.025f) {
+                continue;
+            }
+
+            // Age-weighted fade combined with per-point exponential decay
+            const float orderFrac = static_cast<float>(i + 1) / static_cast<float>(validCount);
+            const float effAlpha = std::clamp(pt.alpha * (0.25f + 0.75f * orderFrac), 0.0f, 1.0f);
+            if (effAlpha < 0.025f) {
+                continue;
+            }
+
+            const auto [rx, ry] = rotate45CCW(pt.r, pt.l);
+            const int x = static_cast<int>(std::lround(pxCx + rx * pxHalfUnit));
+            const int y = static_cast<int>(std::lround(pxCy - ry * pxHalfUnit));
+
+            const uint8_t coreA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 245.0f), 0, 255));
+            const uint8_t ringA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 135.0f), 0, 255));
+            const uint8_t diagA = static_cast<uint8_t>(std::clamp(static_cast<int>(effAlpha * 65.0f), 0, 255));
+
+            // 3x3 soft anti-aliased glowing scatter point
+            blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x, y, kAmberR, kAmberG, kAmberB, coreA);
+            blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x - 1, y, kAmberR, kAmberG, kAmberB, ringA);
+            blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x + 1, y, kAmberR, kAmberG, kAmberB, ringA);
+            blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x, y - 1, kAmberR, kAmberG, kAmberB, ringA);
+            blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x, y + 1, kAmberR, kAmberG, kAmberB, ringA);
+
+            if (effAlpha > 0.35f) {
+                blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x - 1, y - 1, kAmberR, kAmberG, kAmberB, diagA);
+                blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x + 1, y - 1, kAmberR, kAmberG, kAmberB, diagA);
+                blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x - 1, y + 1, kAmberR, kAmberG, kAmberB, diagA);
+                blendPixelPARGB(scan0, stride, clipX0, clipY0, clipX1, clipY1, x + 1, y + 1, kAmberR, kAmberG, kAmberB, diagA);
+            }
+        }
+
+        backBuffer_->UnlockBits(&bmpData);
     }
 
     void paintSliderCard(Graphics& g) {
@@ -783,14 +845,24 @@ private:
         drawRoundRect(g, sliderTrackBox_, kBorderHairline, 3.0f, 1.0f);
 
         const float centerX = sliderTrackBox_.x + sliderTrackBox_.w * 0.5f;
+        const float left45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.375f;  // -45 deg
+        const float right45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.625f; // +45 deg
         const float thumbX =
             sliderTrackBox_.x + sliderTrackBox_.w * static_cast<float>(std::clamp(normalizedAngle_, 0.0, 1.0));
         const float trackCenterY = sliderTrackBox_.y + sliderTrackBox_.h * 0.5f;
 
-        // Center 0 deg tick mark
+        // Ticks at -45 deg (typical far right), 0 deg (center), and +45 deg (typical far left)
         {
-            Pen tickPen(kBorderActive, 1.0f);
-            g.DrawLine(&tickPen, centerX, sliderTrackBox_.y - 3.0f, centerX, sliderTrackBox_.y + sliderTrackBox_.h + 3.0f);
+            Pen centerTickPen(kBorderActive, 1.2f);
+            g.DrawLine(&centerTickPen, centerX, sliderTrackBox_.y - 4.0f, centerX, sliderTrackBox_.y + sliderTrackBox_.h + 4.0f);
+
+            Pen tick45Pen(withAlpha(kTextSecondary, 0.75f), 1.1f);
+            g.DrawLine(&tick45Pen, left45X, sliderTrackBox_.y - 3.5f, left45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
+            g.DrawLine(&tick45Pen, right45X, sliderTrackBox_.y - 3.5f, right45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
+
+            drawLabel(g, L"-45\x00B0", Box{left45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
+            drawLabel(g, L"0\x00B0", Box{centerX - 14.0f, sliderTrackBox_.y + 8.0f, 28.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
+            drawLabel(g, L"+45\x00B0", Box{right45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
         }
 
         // Active bipolar fill from center (0 deg) to thumb
@@ -914,6 +986,13 @@ private:
         switch (message) {
             case WM_ERASEBKGND:
                 return 1;
+
+            case WM_TIMER:
+                if (wParam == kScopeTimerId) {
+                    self->onTimerTick();
+                    return 0;
+                }
+                break;
 
             case WM_CTLCOLOREDIT: {
                 HDC hdc = reinterpret_cast<HDC>(wParam);

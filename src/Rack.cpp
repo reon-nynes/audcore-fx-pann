@@ -7,17 +7,26 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <new>
+#include <unordered_map>
 
 namespace pann {
 namespace {
 
 constexpr char kCode[] = "PANN";
 constexpr char kFuid[] = "A1B2C3D4E5F647898A9B0C1D2E3F4A5B";
-constexpr float kDefaultNormalized = 0.5f; // 0.0 deg
+constexpr float kDefaultNormalized = 0.5f; // 0 deg
 constexpr uint8_t kStateVersion = 1u;
 constexpr uint32_t kStateBytes = 5u;
 constexpr uint32_t kMaxVisualFloatsPerPoll = 1024u; // 512 stereo points
+constexpr uint32_t kTargetScatterPointsPerSec = 4800u; // ~80 points per 60 FPS frame
+
+std::mutex gRegistryMutex;
+std::unordered_map<uint32_t, std::weak_ptr<SharedScopeState>> gRegistry;
+std::weak_ptr<SharedScopeState> gLatestScopeState;
+uint32_t gNextId = 0x00010000u;
 
 struct Rack {
     std::atomic<float> normalizedAngle{kDefaultNormalized};
@@ -25,17 +34,39 @@ struct Rack {
     std::atomic<uint32_t> snapPending{1};
     uint32_t sampleRate = 48000;
     uint32_t channels = 2;
+    uint32_t id = 0;
     LinearSmoother smoother;
-    ScopeRingBuffer ringBuffer;
+    ScopeRingBuffer abiVisualRing;
+    std::shared_ptr<SharedScopeState> scopeState = std::make_shared<SharedScopeState>();
 
-    Rack() noexcept {
+    Rack() {
         smoother.prepare(sampleRate, 0.005);
         smoother.setCurrentAndTarget(static_cast<double>(kDefaultNormalized));
+        scopeState->ringBuffer.setDecimation(sampleRate / kTargetScatterPointsPerSec);
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        do {
+            ++gNextId;
+            if ((gNextId & 0xffffu) == 0u) {
+                ++gNextId;
+            }
+        } while (gNextId < 0x00010001u || gRegistry.count(gNextId) != 0);
+        id = gNextId;
+        gRegistry.emplace(id, scopeState);
+        gLatestScopeState = scopeState;
+    }
+
+    ~Rack() {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        gRegistry.erase(id);
     }
 };
 
 void* create() {
-    return new (std::nothrow) Rack();
+    try {
+        return new Rack();
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 void destroy(void* handle) {
@@ -53,7 +84,15 @@ int prepare(void* handle, uint32_t rate, uint32_t frames, uint32_t channels, uin
     rack->smoother.setCurrentAndTarget(
         static_cast<double>(rack->normalizedAngle.load(std::memory_order_relaxed)));
     rack->snapPending.store(1, std::memory_order_release);
-    rack->ringBuffer.reset();
+    rack->abiVisualRing.reset();
+    rack->scopeState->sampleRate.store(rate, std::memory_order_release);
+    rack->scopeState->ringBuffer.setDecimation(
+        std::max<uint32_t>(1u, rate / kTargetScatterPointsPerSec));
+    rack->scopeState->ringBuffer.reset();
+    {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        gLatestScopeState = rack->scopeState;
+    }
     *latency = 0;
     return 1;
 }
@@ -72,8 +111,9 @@ void process(void* handle, float* stereo, const float* sidechain, uint32_t frame
         rack->smoother.setTarget(static_cast<double>(targetNorm));
     }
 
-    const bool recordVisual = rack->visualActive.load(std::memory_order_relaxed) != 0;
+    const bool recordAbiVisual = rack->visualActive.load(std::memory_order_relaxed) != 0;
     const uint32_t ch = rack->channels;
+    auto& liveRing = rack->scopeState->ringBuffer;
 
     for (uint32_t i = 0; i < frames; ++i) {
         const double norm = rack->smoother.getNextValue();
@@ -83,8 +123,13 @@ void process(void* handle, float* stereo, const float* sidechain, uint32_t frame
         const auto [outL, outR] = rotateStereo(inL, inR, omega);
         stereo[2 * i] = outL;
         stereo[2 * i + 1] = outR;
-        if (recordVisual) {
-            rack->ringBuffer.push(outR, outL);
+
+        // Always sample decimated (R, L) points into the lock-free live scope ring
+        // so the 60 FPS custom editor follows the audio signal with zero lag.
+        liveRing.pushSampled(outR, outL);
+
+        if (recordAbiVisual) {
+            rack->abiVisualRing.push(outR, outL);
         }
     }
 }
@@ -152,7 +197,7 @@ void visual_active(void* handle, int enabled) {
     auto* rack = static_cast<Rack*>(handle);
     const int prev = rack->visualActive.exchange(enabled ? 1 : 0, std::memory_order_acq_rel);
     if (!enabled || !prev) {
-        rack->ringBuffer.reset();
+        rack->abiVisualRing.reset();
     }
 }
 
@@ -165,10 +210,30 @@ uint32_t visual(void* handle, float* out, uint32_t capacity) {
         return 0;
     }
     const uint32_t maxFloats = std::min<uint32_t>(capacity, kMaxVisualFloatsPerPoll);
-    return rack->ringBuffer.popAvailable(out, maxFloats);
+    return rack->abiVisualRing.popAvailable(out, maxFloats);
 }
 
 } // namespace
+
+std::shared_ptr<SharedScopeState> scopeStateFor(uint32_t id) {
+    std::lock_guard<std::mutex> lock(gRegistryMutex);
+    const auto it = gRegistry.find(id);
+    return it == gRegistry.end() ? nullptr : it->second.lock();
+}
+
+std::shared_ptr<SharedScopeState> latestScopeState() {
+    std::lock_guard<std::mutex> lock(gRegistryMutex);
+    if (auto latest = gLatestScopeState.lock()) {
+        return latest;
+    }
+    for (const auto& [id, weak] : gRegistry) {
+        if (auto state = weak.lock()) {
+            return state;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace pann
 
 extern "C" AUDCORE_FX_EXPORT const AudcoreFxRack* audcore_fx_get_rack(uint32_t version) {

@@ -75,20 +75,21 @@ int main() {
         CHECK(std::abs(smoother.getNextValue() - 1.0) < 1e-9);
     }
 
-    // 5. ScopeRingBuffer overflow resilience & even-float popping
+    // 5. ScopeRingBuffer latest-overwriting zero-lag behavior & even-float popping
     {
         ScopeRingBuffer ring;
         for (int i = 0; i < 10000; ++i) {
             ring.push(static_cast<float>(i), static_cast<float>(-i));
         }
-        std::vector<float> out(512, 0.0f);
+        std::vector<float> out(512, 0.0f); // 256 points
         uint32_t popped = ring.popAvailable(out.data(), 512);
         CHECK(popped == 512);
-        CHECK(out[0] == 0.0f && out[1] == 0.0f);
-        CHECK(out[2] == 1.0f && out[3] == -1.0f);
+        // Must skip old backlog and return the most recent 256 points (9744..9999)
+        CHECK(out[0] == 9744.0f && out[1] == -9744.0f);
+        CHECK(out[510] == 9999.0f && out[511] == -9999.0f);
     }
 
-    // 6. ScopeHistory stride downsampling (>512 pts) & NaN sanitization
+    // 6. ScopeHistory stride downsampling (>512 pts), fadeTick, & NaN sanitization
     {
         ScopeHistory hist;
         std::vector<float> batch(2048, 0.5f); // 1024 points -> stride 2 -> 512 points stored
@@ -96,6 +97,9 @@ int main() {
         hist.pushInterleavedRL(batch.data(), batch.size());
         CHECK(hist.count() == 512);
         CHECK(!std::isfinite(hist.pointAt(1).r) && !std::isfinite(hist.pointAt(1).l));
+        const float alphaBefore = hist.scatterPointAt(511).alpha;
+        CHECK(hist.fadeTick(0.86f));
+        CHECK(hist.scatterPointAt(511).alpha < alphaBefore);
     }
 
     std::printf("All PannTests passed.\n");

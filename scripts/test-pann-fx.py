@@ -199,7 +199,13 @@ def main(dll_path: str):
         rack.destroy(inst0)
         rack.destroy(inst1)
 
-    # 4. Offscreen Win32 Host HWND + Custom GDI+ Editor lifecycle
+    # 4. Offscreen Win32 Host HWND + Custom GDI+ Editor lifecycle + Live Rack->Editor scope bridge
+    live_inst = rack.create()
+    assert live_inst
+    latency = u32(0)
+    assert rack.prepare(live_inst, 48000, 256, 2, c.byref(latency)) == 1
+    assert rack.set(live_inst, 0, 0.625) == 1  # +45 deg
+
     user32 = c.windll.user32
     user32.CreateWindowExW.argtypes = [
         w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
@@ -235,7 +241,14 @@ def main(dll_path: str):
             editor.translate(ed, on_translate, None)
             editor.parameter(ed, 0, 0.75)
 
-            # Feed 1024 points (2048 floats) including NaN to verify stride downsampling & GDI+ NaN resilience
+            # Stream live audio through rack.process() and trigger WM_TIMER on the editor child window
+            live_audio = (c.c_float * 512)()
+            for i in range(256):
+                live_audio[2 * i] = math.sin(i * 0.1) * 0.7
+                live_audio[2 * i + 1] = math.cos(i * 0.1) * 0.7
+            rack.process(live_inst, live_audio, None, 256, 120.0)
+
+            # Feed 1024 points (2048 floats) including NaN to verify stride downsampling & scatter NaN resilience
             vis_batch = (c.c_float * 2048)()
             for i in range(1024):
                 angle = i * 0.05
@@ -261,6 +274,12 @@ def main(dll_path: str):
             assert child_hwnd, "Editor child HWND not found"
             edit_hwnd = user32.GetWindow(child_hwnd, 5)  # GW_CHILD (the EDIT textbox)
             assert edit_hwnd, "Integer input EDIT textbox HWND not found"
+
+            # Fire WM_TIMER (0x0113, timer id 1) to pull sampled points from live_inst and fade scatter points
+            user32.SendMessageW(child_hwnd, 0x0113, 1, 0)
+            user32.SendMessageW(child_hwnd, 0x0113, 1, 0)
+            user32.UpdateWindow(child_hwnd)
+            pump_messages()
 
             # Slider at scale 1.25 (logical 420x480 -> sliderCard y ~ 388..456, x ~ 260 -> pixel x=325, y=535)
             lparam_drag_start = (535 << 16) | (325 & 0xFFFF)
@@ -310,6 +329,7 @@ def main(dll_path: str):
             editor.destroy(ed)
     finally:
         user32.DestroyWindow(parent_hwnd)
+        rack.destroy(live_inst)
 
     print("PANN rack ABI, DSP rotation, 5ms smoothing, mono, telemetry, state, and GDI+ editor verified")
 
