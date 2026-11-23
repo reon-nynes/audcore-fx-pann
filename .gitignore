@@ -1,0 +1,13 @@
+build/
+out/
+.vs/
+.idea/
+cmake-build-*/
+*.user
+.DS_Store
+.superpowers/
+.codegraph/
+.worktrees/
+audcore-fx-demo/
+audcore-fx-bilibili/
+Lissajous-src/
