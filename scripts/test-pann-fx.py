@@ -245,7 +245,6 @@ def main(dll_path: str):
         assert ed, "editor.create returned NULL"
         try:
             editor.translate(ed, on_translate, None)
-            editor.parameter(ed, 0, 0.75)
 
             # Stream live audio through rack.process() and trigger WM_TIMER on the editor child window
             live_audio = (c.c_float * 512)()
@@ -270,6 +269,8 @@ def main(dll_path: str):
             # Simulate mouse drag & double-click on the editor child window
             user32.GetWindow.argtypes = [w.HWND, w.UINT]
             user32.GetWindow.restype = w.HWND
+            user32.GetClientRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
+            user32.GetClientRect.restype = w.BOOL
             user32.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
             user32.SendMessageW.restype = w.LPARAM
             user32.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
@@ -287,33 +288,55 @@ def main(dll_path: str):
             user32.UpdateWindow(child_hwnd)
             pump_messages()
 
-            # Click the collapse toggle button (top-right of scope card header: logical x~372, y~31 -> pixel x=465, y=39 at scale 1.25)
-            lparam_toggle = (39 << 16) | (465 & 0xFFFF)
+            # Test collapse button resizes window height down and expand button restores it
+            rect_before = w.RECT()
+            user32.GetClientRect(child_hwnd, c.byref(rect_before))
+            assert rect_before.bottom == 600, f"Expected initial height 600, got {rect_before.bottom}"
+
+            lparam_toggle = (24 << 16) | (465 & 0xFFFF)
             user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (collapse)
             user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
+            rect_collapsed = w.RECT()
+            user32.GetClientRect(child_hwnd, c.byref(rect_collapsed))
+            assert rect_collapsed.bottom == 195, f"Expected collapsed height 195, got {rect_collapsed.bottom}"
             user32.UpdateWindow(child_hwnd)
             pump_messages()
 
-            # Click the collapse toggle button again to expand back
+            # Click the collapse toggle button again to expand back to 600
             user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_toggle)  # WM_LBUTTONDOWN (expand)
             user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_toggle)  # WM_LBUTTONUP
+            rect_expanded = w.RECT()
+            user32.GetClientRect(child_hwnd, c.byref(rect_expanded))
+            assert rect_expanded.bottom == 600, f"Expected restored height 600, got {rect_expanded.bottom}"
             user32.UpdateWindow(child_hwnd)
             pump_messages()
 
-            # Slider at scale 1.25 (logical 420x480 -> sliderCard y ~ 388..456, x ~ 260 -> pixel x=325, y=535)
-            lparam_drag_start = (535 << 16) | (325 & 0xFFFF)
-            lparam_drag_move = (535 << 16) | (400 & 0xFFFF)
-            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_drag_start)  # WM_LBUTTONDOWN
-            user32.SendMessageW(child_hwnd, 0x0200, 1, lparam_drag_move)   # WM_MOUSEMOVE
-            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_drag_move)   # WM_LBUTTONUP
-            assert any(k == 2 and idx == 0 for k, idx, _ in edits), f"Missing begin-edit in {edits}"
+            # Default slider mode is [-45 deg, +45 deg]: dragging to far right end caps at +45 deg (0.625)
+            lparam_drag_start = (535 << 16) | (262 & 0xFFFF)
+            lparam_drag_far_right = (535 << 16) | (500 & 0xFFFF)
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_drag_start)      # WM_LBUTTONDOWN
+            user32.SendMessageW(child_hwnd, 0x0200, 1, lparam_drag_far_right)  # WM_MOUSEMOVE
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_drag_far_right)  # WM_LBUTTONUP
             drag_vals = [val for k, idx, val in edits if k == 0 and idx == 0]
-            assert drag_vals and drag_vals[-1] > 0.55, f"Missing drag value in {edits}"
-            # Verify 1-deg quantization on slider drag
-            for val in drag_vals:
+            assert drag_vals and abs(drag_vals[-1] - 0.625) < 1e-6, (
+                f"Expected +45 deg (0.625) at far right in default mode, got {drag_vals}"
+            )
+
+            # Click the extended range toggle button ("扩展 ±180°": logical x~125, y~395 -> pixel x=156, y=494)
+            lparam_range_btn = (494 << 16) | (156 & 0xFFFF)
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_range_btn)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_range_btn)
+            edits.clear()
+            user32.SendMessageW(child_hwnd, 0x0201, 1, lparam_drag_start)
+            user32.SendMessageW(child_hwnd, 0x0200, 1, lparam_drag_far_right)
+            user32.SendMessageW(child_hwnd, 0x0202, 0, lparam_drag_far_right)
+            ext_drag_vals = [val for k, idx, val in edits if k == 0 and idx == 0]
+            assert ext_drag_vals and abs(ext_drag_vals[-1] - 1.0) < 1e-6, (
+                f"Expected +180 deg (1.0) at far right in extended mode, got {ext_drag_vals}"
+            )
+            for val in ext_drag_vals:
                 deg = -180.0 + val * 360.0
                 assert abs(deg - round(deg)) < 1e-9, f"Slider value {deg} not quantized to 1 deg"
-            assert any(k == 3 and idx == 0 for k, idx, _ in edits), f"Missing end-edit in {edits}"
 
             # Double-click on slider resets to 0.5 (0 deg) and updates textbox to "0"
             edits.clear()

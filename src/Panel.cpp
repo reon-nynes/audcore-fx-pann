@@ -27,6 +27,7 @@ using namespace Gdiplus;
 constexpr wchar_t kWindowClass[] = L"Audcore.Pann.Panel.1";
 constexpr int32_t kDefaultWidth = 420;
 constexpr int32_t kDefaultHeight = 480;
+constexpr float kCollapsedLogicalHeight = 156.0f;
 constexpr float kThumbRadius = 7.0f;
 constexpr UINT_PTR kScopeTimerId = 1;
 constexpr UINT kScopeTimerMs = 16; // ~60 FPS
@@ -48,11 +49,12 @@ struct Words {
     const wchar_t* rotationLabel;
     const wchar_t* collapseLabel;
     const wchar_t* expandLabel;
+    const wchar_t* extendRangeLabel;
 };
 
-constexpr Words kChinese{L"声场相位", L"旋转角度", L"收起", L"展开"};
-constexpr Words kEnglish{L"声场相位", L"ROTATION", L"Hide", L"Show"};
-constexpr Words kJapanese{L"声场相位", L"回転角度", L"隠す", L"表示"};
+constexpr Words kChinese{L"声场相位", L"旋转角度", L"收起", L"展开", L"扩展 ±180°"};
+constexpr Words kEnglish{L"声场相位", L"ROTATION", L"Hide", L"Show", L"Ext ±180°"};
+constexpr Words kJapanese{L"声场相位", L"回転角度", L"隠す", L"表示", L"拡張 ±180°"};
 
 struct Box {
     float x = 0.0f;
@@ -204,19 +206,24 @@ class Panel {
 
     float width_ = static_cast<float>(kDefaultWidth);
     float height_ = static_cast<float>(kDefaultHeight);
+    float expandedLogicalHeight_ = static_cast<float>(kDefaultHeight);
     float scale_ = 1.0f;
 
     double normalizedAngle_ = 0.5; // 0 deg
     bool draggingSlider_ = false;
     bool hoveringSlider_ = false;
     bool hoveringToggle_ = false;
+    bool hoveringRangeBtn_ = false;
     bool scopeCollapsed_ = false;
+    bool extendedRange_ = false; // false = [-45, +45] default; true = [-180, +180]
+    bool inProgrammaticResize_ = false;
     bool trackingLeave_ = false;
     bool updatingEditText_ = false;
 
     Box scopeCardBox_{};
     Box toggleBtnBox_{};
     Box sliderCardBox_{};
+    Box rangeBtnBox_{};
     Box editFrameBox_{};
     Box editInnerBox_{};
     Box sliderTrackBox_{};
@@ -341,6 +348,9 @@ public:
         const int32_t ph = std::max<int32_t>(1, pixelsHigh);
         width_ = static_cast<float>(pw) / scale_;
         height_ = static_cast<float>(ph) / scale_;
+        if (!scopeCollapsed_ && !inProgrammaticResize_ && height_ >= 240.0f) {
+            expandedLogicalHeight_ = height_;
+        }
         if (window_) {
             SetWindowPos(window_, nullptr, 0, 0, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -379,6 +389,10 @@ public:
             return;
         }
         normalizedAngle_ = quantizeNormalizedToIntDegrees(std::clamp(value, 0.0, 1.0));
+        const int deg = normalizedToIntDegrees(normalizedAngle_);
+        if (std::abs(deg) > 45) {
+            extendedRange_ = true;
+        }
         if (!edit_ || GetFocus() != edit_) {
             syncEditBoxText();
         }
@@ -413,13 +427,85 @@ public:
     }
 
 private:
+    int minSliderDeg() const noexcept { return extendedRange_ ? -180 : -45; }
+    int maxSliderDeg() const noexcept { return extendedRange_ ? 180 : 45; }
+
     void invalidate() noexcept {
         if (window_) {
             InvalidateRect(window_, nullptr, FALSE);
         }
     }
 
+    void resizeHostWindowHeight(float targetLogicalH) noexcept {
+        if (!window_) {
+            return;
+        }
+        const int32_t targetPixelH =
+            std::max<int32_t>(1, static_cast<int32_t>(std::lround(targetLogicalH * scale_)));
+        RECT childClient{};
+        GetClientRect(window_, &childClient);
+        const int32_t currentPixelW =
+            std::max<int32_t>(1, static_cast<int32_t>(std::lround(width_ * scale_)));
+        const int32_t currentPixelH =
+            std::max<int32_t>(1, childClient.bottom - childClient.top);
+        const int32_t deltaH = targetPixelH - currentPixelH;
+
+        inProgrammaticResize_ = true;
+        height_ = targetLogicalH;
+        SetWindowPos(window_, nullptr, 0, 0, currentPixelW, targetPixelH, SWP_NOZORDER | SWP_NOACTIVATE);
+
+        if (parent_ && IsWindow(parent_) && deltaH != 0) {
+            HWND root = GetAncestor(parent_, GA_ROOT);
+            if (root && root != parent_ && IsWindow(root)) {
+                RECT parentRect{};
+                if (GetWindowRect(parent_, &parentRect)) {
+                    const int newParentH =
+                        std::max<int>(targetPixelH, (parentRect.bottom - parentRect.top) + deltaH);
+                    SetWindowPos(
+                        parent_,
+                        nullptr,
+                        0,
+                        0,
+                        parentRect.right - parentRect.left,
+                        newParentH,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                RECT rootRect{};
+                if (GetWindowRect(root, &rootRect)) {
+                    const int newRootH =
+                        std::max<int>(targetPixelH, (rootRect.bottom - rootRect.top) + deltaH);
+                    SetWindowPos(
+                        root,
+                        nullptr,
+                        0,
+                        0,
+                        rootRect.right - rootRect.left,
+                        newRootH,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            } else {
+                RECT parentRect{};
+                if (GetWindowRect(parent_, &parentRect)) {
+                    const int newParentH =
+                        std::max<int>(targetPixelH, (parentRect.bottom - parentRect.top) + deltaH);
+                    SetWindowPos(
+                        parent_,
+                        nullptr,
+                        0,
+                        0,
+                        parentRect.right - parentRect.left,
+                        newParentH,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+        }
+        inProgrammaticResize_ = false;
+    }
+
     void toggleScopeCollapsed() noexcept {
+        if (!scopeCollapsed_ && height_ >= 240.0f) {
+            expandedLogicalHeight_ = height_;
+        }
         scopeCollapsed_ = !scopeCollapsed_;
         if (!liveScope_) {
             liveScope_ = latestScopeState();
@@ -434,8 +520,10 @@ private:
                 liveScope_->ringBuffer.reset();
             }
             history_.clear();
+            resizeHostWindowHeight(kCollapsedLogicalHeight);
         } else {
-            // Resume audio-thread scope sampling and 60 FPS UI timer
+            // Restore expanded window height, resume audio-thread scope sampling and 60 FPS UI timer
+            resizeHostWindowHeight(std::max(320.0f, expandedLogicalHeight_));
             if (liveScope_) {
                 liveScope_->ringBuffer.reset();
                 liveScope_->scopeEnabled.store(1, std::memory_order_relaxed);
@@ -445,6 +533,22 @@ private:
             }
         }
         updateLayout();
+        invalidate();
+    }
+
+    void toggleExtendedRange() noexcept {
+        extendedRange_ = !extendedRange_;
+        if (!extendedRange_) {
+            // Clamp active angle into [-45, +45] when switching back to default range
+            const int curDeg = normalizedToIntDegrees(normalizedAngle_);
+            if (curDeg < -45 || curDeg > 45) {
+                const double clampedNorm = intDegreesToNormalized(std::clamp(curDeg, -45, 45));
+                emitEdit(2, clampedNorm);
+                setAngleInteractive(clampedNorm);
+                emitEdit(3, clampedNorm);
+                return;
+            }
+        }
         invalidate();
     }
 
@@ -491,6 +595,9 @@ private:
         GetWindowTextW(edit_, buf, static_cast<int>(std::size(buf)));
         int parsedDeg = 0;
         if (tryParseIntDegrees(buf, parsedDeg)) {
+            if (std::abs(parsedDeg) > 45) {
+                extendedRange_ = true;
+            }
             const double nextNorm = intDegreesToNormalized(parsedDeg);
             emitEdit(2, nextNorm);
             setAngleInteractive(nextNorm);
@@ -502,7 +609,7 @@ private:
 
     void stepByDegrees(int deltaDeg) noexcept {
         const int curDeg = normalizedToIntDegrees(normalizedAngle_);
-        const int nextDeg = std::clamp(curDeg + deltaDeg, -180, 180);
+        const int nextDeg = std::clamp(curDeg + deltaDeg, minSliderDeg(), maxSliderDeg());
         const double nextNorm = intDegreesToNormalized(nextDeg);
         emitEdit(2, nextNorm);
         setAngleInteractive(nextNorm);
@@ -547,6 +654,14 @@ private:
             toggleH
         };
 
+        // Extended range toggle button next to "旋转角度" title inside sliderCardBox_ header
+        rangeBtnBox_ = Box{
+            sliderCardBox_.x + 76.0f,
+            sliderCardBox_.y + 9.0f,
+            74.0f,
+            22.0f
+        };
+
         // Top-right integer input box inside sliderCardBox_
         const float frameW = 70.0f;
         const float frameH = 24.0f;
@@ -580,9 +695,25 @@ private:
         if (sliderTrackBox_.w <= 1.0f) {
             return 0.5;
         }
-        const double rawNorm =
+        const double t =
             std::clamp(static_cast<double>((lx - sliderTrackBox_.x) / sliderTrackBox_.w), 0.0, 1.0);
-        return quantizeNormalizedToIntDegrees(rawNorm);
+        const int minDeg = minSliderDeg();
+        const int maxDeg = maxSliderDeg();
+        const int deg = std::clamp(
+            static_cast<int>(std::lround(static_cast<double>(minDeg) + t * static_cast<double>(maxDeg - minDeg))),
+            minDeg,
+            maxDeg);
+        return intDegreesToNormalized(deg);
+    }
+
+    float sliderProportionFromNormalized(double norm) const noexcept {
+        const int minDeg = minSliderDeg();
+        const int maxDeg = maxSliderDeg();
+        const int deg = std::clamp(normalizedToIntDegrees(norm), minDeg, maxDeg);
+        return std::clamp(
+            static_cast<float>(deg - minDeg) / static_cast<float>(maxDeg - minDeg),
+            0.0f,
+            1.0f);
     }
 
     void emitEdit(int32_t kind, double norm) noexcept {
@@ -900,12 +1031,34 @@ private:
         drawLabel(
             g,
             words_->rotationLabel,
-            Box{sliderCardBox_.x + 12.0f, headerY, 160.0f, 20.0f},
+            Box{sliderCardBox_.x + 12.0f, headerY, 64.0f, 20.0f},
             12.5f,
             kTextPrimary,
             true,
             false,
             StringAlignmentNear);
+
+        // Extended range toggle button ("扩展 ±180°") right next to "旋转角度"
+        fillRoundRect(
+            g,
+            rangeBtnBox_,
+            extendedRange_ ? withAlpha(kAmberTrace, 0.16f) : (hoveringRangeBtn_ ? kBgSurfaceHover : kBgField),
+            4.0f);
+        drawRoundRect(
+            g,
+            rangeBtnBox_,
+            extendedRange_ ? kAmberTrace : (hoveringRangeBtn_ ? kBorderActive : kBorderHairline),
+            4.0f,
+            extendedRange_ ? 1.2f : 1.0f);
+        drawLabel(
+            g,
+            words_->extendRangeLabel,
+            rangeBtnBox_,
+            10.5f,
+            extendedRange_ ? kAmberTrace : (hoveringRangeBtn_ ? kTextPrimary : kTextSecondary),
+            extendedRange_,
+            false,
+            StringAlignmentCenter);
 
         // Integer input textbox frame + degree unit label
         fillRoundRect(g, editFrameBox_, kBgField, 4.0f);
@@ -925,10 +1078,10 @@ private:
             true,
             StringAlignmentCenter);
 
-        // Endpoint scale labels (-180 deg / +180 deg)
+        // Endpoint scale labels (-45 deg / +45 deg by default, or -180 deg / +180 deg when extendedRange_ is active)
         drawLabel(
             g,
-            L"-180\x00B0",
+            extendedRange_ ? L"-180\x00B0" : L"-45\x00B0",
             Box{sliderCardBox_.x + 8.0f, sliderTrackBox_.y - 7.0f, 36.0f, 20.0f},
             10.5f,
             kTextDim,
@@ -937,7 +1090,7 @@ private:
             StringAlignmentFar);
         drawLabel(
             g,
-            L"+180\x00B0",
+            extendedRange_ ? L"+180\x00B0" : L"+45\x00B0",
             Box{sliderTrackBox_.x + sliderTrackBox_.w + 4.0f, sliderTrackBox_.y - 7.0f, 38.0f, 20.0f},
             10.5f,
             kTextDim,
@@ -950,24 +1103,25 @@ private:
         drawRoundRect(g, sliderTrackBox_, kBorderHairline, 3.0f, 1.0f);
 
         const float centerX = sliderTrackBox_.x + sliderTrackBox_.w * 0.5f;
-        const float left45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.375f;  // -45 deg (typical far left)
-        const float right45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.625f; // +45 deg (typical far right)
-        const float thumbX =
-            sliderTrackBox_.x + sliderTrackBox_.w * static_cast<float>(std::clamp(normalizedAngle_, 0.0, 1.0));
+        const float sliderProp = sliderProportionFromNormalized(normalizedAngle_);
+        const float thumbX = sliderTrackBox_.x + sliderTrackBox_.w * sliderProp;
         const float trackCenterY = sliderTrackBox_.y + sliderTrackBox_.h * 0.5f;
 
-        // Ticks at -45 deg (typical far left), 0 deg (center), and +45 deg (typical far right)
+        // Tick marks on the slider track
         {
             Pen centerTickPen(kBorderActive, 1.2f);
             g.DrawLine(&centerTickPen, centerX, sliderTrackBox_.y - 4.0f, centerX, sliderTrackBox_.y + sliderTrackBox_.h + 4.0f);
-
-            Pen tick45Pen(withAlpha(kTextSecondary, 0.75f), 1.1f);
-            g.DrawLine(&tick45Pen, left45X, sliderTrackBox_.y - 3.5f, left45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
-            g.DrawLine(&tick45Pen, right45X, sliderTrackBox_.y - 3.5f, right45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
-
-            drawLabel(g, L"-45\x00B0", Box{left45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
             drawLabel(g, L"0\x00B0", Box{centerX - 14.0f, sliderTrackBox_.y + 8.0f, 28.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
-            drawLabel(g, L"+45\x00B0", Box{right45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
+
+            if (extendedRange_) {
+                const float left45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.375f;  // -45 deg
+                const float right45X = sliderTrackBox_.x + sliderTrackBox_.w * 0.625f; // +45 deg
+                Pen tick45Pen(withAlpha(kTextSecondary, 0.75f), 1.1f);
+                g.DrawLine(&tick45Pen, left45X, sliderTrackBox_.y - 3.5f, left45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
+                g.DrawLine(&tick45Pen, right45X, sliderTrackBox_.y - 3.5f, right45X, sliderTrackBox_.y + sliderTrackBox_.h + 3.5f);
+                drawLabel(g, L"-45\x00B0", Box{left45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
+                drawLabel(g, L"+45\x00B0", Box{right45X - 18.0f, sliderTrackBox_.y + 8.0f, 36.0f, 14.0f}, 9.5f, kTextDim, false, true, StringAlignmentCenter);
+            }
         }
 
         // Active bipolar fill from center (0 deg) to thumb
@@ -1125,6 +1279,11 @@ private:
                     self->toggleScopeCollapsed();
                     return 0;
                 }
+                if (self->rangeBtnBox_.contains(lx, ly)) {
+                    SetFocus(hwnd);
+                    self->toggleExtendedRange();
+                    return 0;
+                }
                 if (self->editFrameBox_.contains(lx, ly) && self->edit_) {
                     SetFocus(self->edit_);
                     SendMessageW(self->edit_, EM_SETSEL, 0, -1);
@@ -1158,9 +1317,13 @@ private:
                 } else {
                     const bool hotSlider = self->sliderHitBox_.contains(lx, ly);
                     const bool hotToggle = self->toggleBtnBox_.contains(lx, ly);
-                    if (hotSlider != self->hoveringSlider_ || hotToggle != self->hoveringToggle_) {
+                    const bool hotRange = self->rangeBtnBox_.contains(lx, ly);
+                    if (hotSlider != self->hoveringSlider_
+                        || hotToggle != self->hoveringToggle_
+                        || hotRange != self->hoveringRangeBtn_) {
                         self->hoveringSlider_ = hotSlider;
                         self->hoveringToggle_ = hotToggle;
+                        self->hoveringRangeBtn_ = hotRange;
                         self->invalidate();
                     }
                 }
@@ -1194,7 +1357,12 @@ private:
                     self->toggleScopeCollapsed();
                     return 0;
                 }
+                if (message == WM_LBUTTONDBLCLK && self->rangeBtnBox_.contains(lx, ly)) {
+                    self->toggleExtendedRange();
+                    return 0;
+                }
                 if (!self->editFrameBox_.contains(lx, ly)
+                    && !self->rangeBtnBox_.contains(lx, ly)
                     && (self->sliderHitBox_.contains(lx, ly) || self->sliderCardBox_.contains(lx, ly))) {
                     self->resetToCenter();
                 }
@@ -1213,9 +1381,10 @@ private:
 
             case WM_MOUSELEAVE: {
                 self->trackingLeave_ = false;
-                if (self->hoveringSlider_ || self->hoveringToggle_) {
+                if (self->hoveringSlider_ || self->hoveringToggle_ || self->hoveringRangeBtn_) {
                     self->hoveringSlider_ = false;
                     self->hoveringToggle_ = false;
+                    self->hoveringRangeBtn_ = false;
                     self->invalidate();
                 }
                 return 0;
