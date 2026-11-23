@@ -16,7 +16,7 @@ $$\text{out}_L = L\cos\omega - R\sin\omega, \quad \text{out}_R = R\cos\omega + L
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-local-pann.ps1
 ```
 
-构建产物位于 `build/package/pann-v0.1.2.fx.audcore`。
+构建产物位于 `build/package/pann-v0.1.3.fx.audcore`。
 
 ## 许可证
 
